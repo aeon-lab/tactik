@@ -1,0 +1,74 @@
+# --- Python cache files ---
+
+**pycache**/
+*.py[cod]
+*$py.class
+
+# --- Build and distribution artifacts ---
+
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# --- Virtual environments ---
+
+.venv/
+venv/
+env/
+ENV/
+
+# --- Testing and coverage ---
+
+.coverage
+.tox/
+.nox/
+.pytest_cache/
+coverage.xml
+htmlcov/
+
+# --- Logs and temporary files ---
+
+*.log
+*.tmp
+*.bak
+
+# --- Jupyter and notebooks ---
+
+.ipynb_checkpoints/
+*.ipynb
+
+# --- IDE and editor files ---
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS-specific files ---
+
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Optional: build system artifacts ---
+
+*.pyo
+*.pyd
+*.pdb
+
+# --- Optional: data or model outputs (if not part of package) ---
+
+/data/
+*.h5
+*.pkl
+*.csv
+*.json
+
+# --- Keep project metadata ---
+
+!pyproject.toml
+!README.*
+!LICENSE*
+!MANIFEST.in

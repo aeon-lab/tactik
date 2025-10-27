@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tactik"
+version = "0.1.0"
+description = "A Python library for topic modeling, clustering, and NLP analysis."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+
+authors = [
+    { name = "Your Name", email = "you@example.com" }
+]
+
+dependencies = [
+    "matplotlib==3.8.0",
+    "numpy==1.24.4",
+    "pandas==1.5.3",
+    "scikit-learn==1.2.2",
+    "scipy==1.10.1",
+    "seaborn==0.12.2",
+    "tqdm==4.65.0",
+    "gensim==4.3.0",
+    "hdbscan==0.8.40",
+    "nltk",
+    "sentence-transformers==4.1.0",
+    "spacy==3.8.7",
+    "torch==2.3.0+cpu",
+    "transformers==4.52.3",
+    "umap-learn==0.5.7",
+    "yake==0.4.8"
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/your-package"
+Documentation = "https://yourusername.github.io/your-package"
+Source = "https://github.com/yourusername/your-package"
+Issues = "https://github.com/yourusername/your-package/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]

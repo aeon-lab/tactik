@@ -1,0 +1,14 @@
+# Include top-level files
+include README.md
+include LICENSE
+include pyproject.toml
+
+# Include everything in docs and examples folders
+recursive-include docs *
+recursive-include examples *
+
+# Include all text and CSV files inside your package
+recursive-include myawesomepkg *.txt *.csv
+
+# Exclude compiled or cache files
+global-exclude *.pyc *.pyo __pycache__ *
