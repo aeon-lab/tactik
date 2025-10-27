@@ -6,7 +6,7 @@ import re
 from tqdm import tqdm
 import spacy
 from spacy.lang.en.stop_words import STOP_WORDS
-from utilities import (
+from .utilities import (
     preprocess_text, 
     handle_punctuation, 
     remove_num, 
@@ -235,92 +235,42 @@ def define_stopwords(SDRS,
     # Convert back to list and return
     return list(stopwords_set)
 
+import spacy
+import subprocess
+import sys
+import logging
+
+_cached_models = {}
+
 def load_spacy_model(disable_pipes=None, use_cache=True):
-    """
-    Load and configure the spaCy English language model.
-    
-    Loads the 'en_core_web_lg' spaCy model and optionally disables specified
-    pipeline components to improve processing speed when certain features
-    are not needed. Models are cached by default to avoid expensive reloading.
-    
-    Parameters
-    ----------
-    disable_pipes : list of str or None, optional
-        List of pipeline component names to disable. If None, defaults to ['ner'].
-        Common pipes include: 'tok2vec', 'tagger', 'parser', 'ner', 'lemmatizer',
-        'attribute_ruler', 'senter'.
-    use_cache : bool, optional
-        Whether to use cached model if available (default: True). Set to False
-        to force reload the model.
-    
-    Returns
-    -------
-    spacy.language.Language
-        Configured spaCy language model with specified pipes disabled.
-    
-    Raises
-    ------
-    OSError
-        If the 'en_core_web_lg' model is not installed.
-    ValueError
-        If disable_pipes contains invalid pipe names or is not iterable.
-    
-    Notes
-    -----
-    The 'en_core_web_lg' model must be installed before using this function:
-        python -m spacy download en_core_web_lg
-    
-    Disabling unnecessary pipes can significantly improve processing speed.
-    For example, if you only need tokenization and lemmatization, you can
-    disable 'ner', 'parser', and 'tagger'.
-    
-    """
-    # Initialize default
     if disable_pipes is None:
         disable_pipes = ['ner']
     
-    # Validate input type
     if not hasattr(disable_pipes, '__iter__') or isinstance(disable_pipes, str):
         raise ValueError("disable_pipes must be an iterable (list, set, etc.), not a string or non-iterable")
     
-    # Convert to tuple for use as dict key (lists aren't hashable)
     disable_pipes_tuple = tuple(sorted(disable_pipes))
-    
-    # Check cache if enabled
     if use_cache and disable_pipes_tuple in _cached_models:
-        logging.info(f"Using cached spaCy model with disabled pipes: {list(disable_pipes_tuple)}")
         return _cached_models[disable_pipes_tuple]
     
-    # Try to load the model
     try:
         nlp = spacy.load("en_core_web_lg")
-    except OSError as e:
-        raise OSError(
-            "Could not load 'en_core_web_lg' model. "
-            "Please install it with: python -m spacy download en_core_web_lg"
-        ) from e
+    except OSError:
+        logging.info("Model 'en_core_web_lg' not found. Attempting automatic download...")
+        subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_lg"], check=True)
+        nlp = spacy.load("en_core_web_lg")
     
-    # Validate pipe names before disabling
+    # Disable specified pipes
+    invalid_pipes = [pipe for pipe in disable_pipes if pipe not in nlp.pipe_names]
+    if invalid_pipes:
+        raise ValueError(f"Invalid pipe names: {invalid_pipes}. Available: {nlp.pipe_names}")
+    
     if disable_pipes:
-        available_pipes = nlp.pipe_names
-        invalid_pipes = [pipe for pipe in disable_pipes if pipe not in available_pipes]
-        
-        if invalid_pipes:
-            raise ValueError(
-                f"Invalid pipe names: {invalid_pipes}. "
-                f"Available pipes are: {available_pipes}"
-            )
-        
-        # Disable specified pipes
-        try:
-            nlp.disable_pipes(*disable_pipes)
-            logging.info(f"Disabled spaCy pipes: {list(disable_pipes)}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to disable pipes: {list(disable_pipes)}. Error: {e}") from e
+        nlp.disable_pipes(*disable_pipes)
     
-    # Log active pipes
+    _cached_models[disable_pipes_tuple] = nlp
     logging.info(f"Active spaCy pipes: {nlp.pipe_names}")
-    
+
     # Cache the model if caching is enabled
     if use_cache:
         _cached_models[disable_pipes_tuple] = nlp

@@ -2,14 +2,14 @@ from typing import Optional, Dict, Any, List
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from preprocessing import pre_processing_routine, remove_stopwords_corpus, define_stopwords
-from clustering_tuning import full_clustering_pipeline, full_clustering_pipeline_fixed_params
-from visualization import plot_clusters, plot_clusters_with_annotations
-from embeddings import vectorize_text
+from .preprocessing import pre_processing_routine, remove_stopwords_corpus, define_stopwords
+from .clustering_tuning import full_clustering_pipeline, full_clustering_pipeline_fixed_params
+from .visualization import plot_clusters, plot_clusters_with_annotations
+from .embeddings import vectorize_text
 
 # Import these at module level so they can be mocked in tests
 try:
-    from topic_extraction import KeywordExtractor, TopicModeler
+    from .topic_extraction import KeywordExtractor, TopicModeler
 except ImportError:
     # Fallback if module not available
     KeywordExtractor = None

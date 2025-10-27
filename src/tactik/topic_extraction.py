@@ -25,8 +25,8 @@ from typing import List, Dict, Tuple, Optional
 import numpy as np
 import logging
 
-# Import missing dependencies from utilities
-from utilities import (
+
+from .utilities import (
     calculate_tf_corpus,
     calculate_tfidf_corpus,
     calculate_tfdf_corpus,

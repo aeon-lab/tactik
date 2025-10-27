@@ -7,7 +7,7 @@ from sentence_transformers import SentenceTransformer
 from gensim import downloader as api 
 from gensim.models import Word2Vec
 import numpy as np
-from utilities import get_number_unique_words
+from .utilities import get_number_unique_words
 import torch
 
 

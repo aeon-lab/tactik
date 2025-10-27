@@ -10,11 +10,70 @@ import spacy
 import heapq
 
 # Load Spacy model (assuming it's needed for spacy_tokenizer)
-nlp = spacy.load("en_core_web_sm")
+
 stopwords = spacy.lang.en.stop_words.STOP_WORDS
 punctuations = string.punctuation
 _RE_COMBINE_WHITESPACE = re.compile(r"\s+")
 _RE_DIGITS = re.compile(r"\d")
+
+import spacy
+import subprocess
+import sys
+import logging
+
+_cached_models = {}
+
+def load_spacy_model(
+    model_name="en_core_web_sm",
+    disable_pipes=None,
+    use_cache=True
+):
+    """
+    Load a spaCy language model with optional pipe disabling and caching.
+    
+    Parameters
+    ----------
+    model_name : str
+        Name of the spaCy model to load (default: 'en_core_web_sm').
+    disable_pipes : list of str or None
+        Pipeline components to disable for faster processing (default: ['ner']).
+    use_cache : bool
+        Whether to return cached model if available (default: True).
+
+    Returns
+    -------
+    spacy.language.Language
+        The loaded spaCy model.
+    """
+    if disable_pipes is None:
+        disable_pipes = ['ner']
+    
+    if not hasattr(disable_pipes, '__iter__') or isinstance(disable_pipes, str):
+        raise ValueError("disable_pipes must be an iterable (list, set, etc.), not a string or non-iterable")
+    
+    key = (model_name, tuple(sorted(disable_pipes)))
+    if use_cache and key in _cached_models:
+        return _cached_models[key]
+
+    try:
+        nlp = spacy.load(model_name)
+    except OSError:
+        logging.info(f"Model '{model_name}' not found. Attempting to download...")
+        subprocess.run([sys.executable, "-m", "spacy", "download", model_name], check=True)
+        nlp = spacy.load(model_name)
+
+    # Disable requested pipes
+    invalid_pipes = [pipe for pipe in disable_pipes if pipe not in nlp.pipe_names]
+    if invalid_pipes:
+        raise ValueError(f"Invalid pipes: {invalid_pipes}. Available: {nlp.pipe_names}")
+    
+    if disable_pipes:
+        nlp.disable_pipes(*disable_pipes)
+
+    _cached_models[key] = nlp
+    logging.info(f"Loaded spaCy model '{model_name}' with active pipes: {nlp.pipe_names}")
+    return nlp
+
 def extract_features(narrative, n=3):
     '''
     Extract word and n-gram features from a narrative text.

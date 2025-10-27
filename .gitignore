@@ -13,7 +13,8 @@ dist/
 .eggs/
 
 # --- Virtual environments ---
-
+# Virtual environments
+test_env/
 .venv/
 venv/
 env/
