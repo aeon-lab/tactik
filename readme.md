@@ -1,4 +1,4 @@
-<img src="tactik_header.png" alt="TACTIK Header" width="800" style="display:block;margin:auto;"/>
+<img src="https://raw.githubusercontent.com/npsAub/tactik/main/tactik_header.png" alt="TACTIK Header" width="800" style="display:block;margin:auto;"/>
 
 # TACTIK
 ## Text Analysis, Clustering, Tuning, Information and Keyword Extraction

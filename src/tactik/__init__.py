@@ -5,7 +5,7 @@ Text Analysis, Clustering, Tuning, Information and Keyword Extraction
 """
 
 # Package version
-__version__ = "0.1.4"
+__version__ = "0.1.6"
 
 
 from . import clustering_pipeline
