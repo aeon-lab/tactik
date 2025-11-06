@@ -564,8 +564,7 @@ class ClusteringPipeline:
         modeler = TopicModeler(
             texts=self.df['Processed_Narrative'].tolist(),
             clusters=self.df['Clusters'].tolist(),
-            designators=designators,
-            random_state=rs
+            designators=designators
         )
         
         modeler.train_lda(num_topics=num_topics, passes=passes, random_state=rs)
