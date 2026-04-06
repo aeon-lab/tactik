@@ -9,26 +9,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       
-      - name: Build draft PDF
-        uses: openjournals/openjournals-draft-action@master
-        with:
-          journal: joss
-          paper-path: paper/paper.md
-      
-      - name: Copy PDF to paper directory
+      - name: Build PDF with Docker directly
         run: |
-          # Find the generated PDF
-          PDF_PATH=$(find /tmp -name "*.pdf" -type f -exec ls -t {} + | head -1)
-          if [ -z "$PDF_PATH" ]; then
-            echo "❌ No PDF found!"
-            exit 1
-          fi
-          echo "Found PDF at: $PDF_PATH"
+          # Run the same container the action uses
+          docker run --rm \
+            -v "$(pwd)":/workspace \
+            -w /workspace \
+            openjournals/inara:latest \
+            -o pdf paper/paper.md
           
-          # Copy to the same directory as paper.md
-          cp "$PDF_PATH" paper/paper.pdf
-          echo "✅ PDF copied to paper/paper.pdf"
-          ls -lh paper/paper.pdf
+          # The PDF should now be in paper/ directory
+          ls -la paper/*.pdf
+          
+          # If it's not there, check for it
+          find . -name "*.pdf" -exec cp {} paper/paper.pdf \;
       
       - name: Upload
         uses: actions/upload-artifact@v4
