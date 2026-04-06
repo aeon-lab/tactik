@@ -314,7 +314,7 @@ def get_tsne_embeddings(X, n_components=2, perplexity=None, early_exaggeration=1
     tsne_model : TSNE
         The fitted t-SNE model object. Useful for accessing:
         - Final KL divergence: tsne_model.kl_divergence_
-        - Number of iterations run: tsne_model.max_iter_
+        - Number of iterations run: tsne_model.max_iter
         Note: Unlike UMAP, t-SNE does not support transforming new data.
         
     Raises:
@@ -409,7 +409,7 @@ def get_tsne_embeddings(X, n_components=2, perplexity=None, early_exaggeration=1
         
         # Optionally report convergence info
         if verbose > 0:
-            print(f"t-SNE completed in {tsne.max_iter_} iterations")
+            print(f"t-SNE completed in {tsne.max_iter} iterations")
             print(f"Final KL divergence: {tsne.kl_divergence_:.4f}")
         
         return embeddings, tsne

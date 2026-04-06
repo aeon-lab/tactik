@@ -223,7 +223,7 @@ class TestGetTSNEEmbeddings(unittest.TestCase):
             # Use method='exact' to avoid barnes_hut limitation
             try:
                 embeddings, model = get_tsne_embeddings(
-                    self.X, n_components=5, random_state=42, n_iter=250
+                    self.X, n_components=5, random_state=42, max_iter=250
                 )
                 self.assertTrue(any("unusual" in str(warning.message) for warning in w))
             except RuntimeError:
@@ -233,7 +233,7 @@ class TestGetTSNEEmbeddings(unittest.TestCase):
     def test_n_iter_too_small(self):
         """Test n_iter < 250 raises ValueError"""
         with self.assertRaises(ValueError) as cm:
-            get_tsne_embeddings(self.X, n_iter=100)
+            get_tsne_embeddings(self.X, max_iter=100)
         self.assertIn("too small", str(cm.exception))
     
     def test_early_exaggeration_validation(self):
