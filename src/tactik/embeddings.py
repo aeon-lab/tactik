@@ -235,7 +235,7 @@ def get_umap_embeddings(X, n_components=5, n_neighbors=10, min_dist=0.0,
         raise RuntimeError(f"Failed to generate UMAP embeddings: {str(e)}")
 
 def get_tsne_embeddings(X, n_components=2, perplexity=None, early_exaggeration=12, 
-                        learning_rate='auto', n_iter=1000, metric='euclidean',
+                        learning_rate='auto', max_iter=1000, metric='euclidean',
                         random_state=None, verbose=0):
     """
     Generate t-SNE embeddings for dimensionality reduction and visualization of text data.
@@ -281,7 +281,7 @@ def get_tsne_embeddings(X, n_components=2, perplexity=None, early_exaggeration=1
         - Too high: Poor convergence or unstable results
         - Too low: Slow convergence, may get stuck in local minima
         
-    n_iter : int, optional (default=1000)
+    max_iter : int, optional (default=1000)
         Maximum number of iterations for optimization. Increase if the algorithm
         hasn't converged (check via kl_divergence_ attribute of returned model).
         Typical range: 1000 to 5000 for good convergence.
@@ -314,7 +314,7 @@ def get_tsne_embeddings(X, n_components=2, perplexity=None, early_exaggeration=1
     tsne_model : TSNE
         The fitted t-SNE model object. Useful for accessing:
         - Final KL divergence: tsne_model.kl_divergence_
-        - Number of iterations run: tsne_model.n_iter_
+        - Number of iterations run: tsne_model.max_iter_
         Note: Unlike UMAP, t-SNE does not support transforming new data.
         
     Raises:
@@ -379,9 +379,9 @@ def get_tsne_embeddings(X, n_components=2, perplexity=None, early_exaggeration=1
     if early_exaggeration < 1:
         raise ValueError(f"early_exaggeration must be >= 1, got {early_exaggeration}")
     
-    if n_iter < 250:
+    if max_iter < 250:
         raise ValueError(
-            f"n_iter ({n_iter}) is too small. Recommended minimum is 250. "
+            f"max_iter ({max_iter}) is too small. Recommended minimum is 250. "
             f"Consider using at least 1000 for good convergence."
         )
     
@@ -399,7 +399,7 @@ def get_tsne_embeddings(X, n_components=2, perplexity=None, early_exaggeration=1
             perplexity=perplexity,
             early_exaggeration=early_exaggeration,
             learning_rate=learning_rate,
-            n_iter=n_iter,
+            max_iter=max_iter,
             metric=metric,
             random_state=random_state,
             verbose=verbose
@@ -409,7 +409,7 @@ def get_tsne_embeddings(X, n_components=2, perplexity=None, early_exaggeration=1
         
         # Optionally report convergence info
         if verbose > 0:
-            print(f"t-SNE completed in {tsne.n_iter_} iterations")
+            print(f"t-SNE completed in {tsne.max_iter_} iterations")
             print(f"Final KL divergence: {tsne.kl_divergence_:.4f}")
         
         return embeddings, tsne
