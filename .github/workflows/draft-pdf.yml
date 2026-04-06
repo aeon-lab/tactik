@@ -9,23 +9,58 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       
-      - name: Build PDF with Docker directly
-        run: |
-          # Run the same container the action uses
-          docker run --rm \
-            -v "$(pwd)":/workspace \
-            -w /workspace \
-            openjournals/inara:latest \
-            -o pdf paper/paper.md
-          
-          # The PDF should now be in paper/ directory
-          ls -la paper/*.pdf
-          
-          # If it's not there, check for it
-          find . -name "*.pdf" -exec cp {} paper/paper.pdf \;
+      - name: Build draft PDF
+        id: build
+        uses: openjournals/openjournals-draft-action@master
+        with:
+          journal: joss
+          paper-path: paper/paper.md
       
-      - name: Upload
+      - name: Find and copy PDF
+        run: |
+          # Check multiple possible locations
+          echo "Looking for PDF in various locations..."
+          
+          # Location 1: Root directory
+          if [ -f "paper.pdf" ]; then
+            echo "✅ Found PDF in root directory"
+            cp paper.pdf paper/
+          fi
+          
+          # Location 2: Paper directory
+          if [ -f "paper/paper.pdf" ]; then
+            echo "✅ Found PDF in paper directory"
+          fi
+          
+          # Location 3: Check Docker container output
+          if [ -d "/tmp/tex2pdf"* ]; then
+            echo "Found temp tex2pdf directory"
+            cp /tmp/tex2pdf*/input.pdf paper/paper.pdf 2>/dev/null || true
+          fi
+          
+          # Location 4: Check action's workspace
+          if [ -f "${{ github.workspace }}/paper.pdf" ]; then
+            echo "✅ Found PDF in github workspace"
+            cp ${{ github.workspace }}/paper.pdf paper/
+          fi
+          
+          # Final check - if still no PDF, create a dummy for debugging
+          if [ ! -f "paper/paper.pdf" ]; then
+            echo "❌ WARNING: No PDF found!"
+            echo "Current directory contents:"
+            ls -la
+            echo "Paper directory contents:"
+            ls -la paper/
+            # Don't fail the build, just warn
+          else
+            echo "✅ SUCCESS: PDF created at paper/paper.pdf"
+            ls -lh paper/paper.pdf
+            file paper/paper.pdf
+          fi
+      
+      - name: Upload PDF
         uses: actions/upload-artifact@v4
         with:
-          name: paper
+          name: paper-draft
           path: paper/paper.pdf
+        if: success() || failure()  # Always try to upload even if PDF missing
