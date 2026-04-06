@@ -8,17 +8,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      
       - name: Build draft PDF
         uses: openjournals/openjournals-draft-action@master
         with:
           journal: joss
-          # This should be the path to the paper within your repo.
           paper-path: paper/paper.md
+      
+      - name: Copy PDF to paper directory
+        run: |
+          # Find the generated PDF
+          PDF_PATH=$(find /tmp -name "*.pdf" -type f -exec ls -t {} + | head -1)
+          if [ -z "$PDF_PATH" ]; then
+            echo "❌ No PDF found!"
+            exit 1
+          fi
+          echo "Found PDF at: $PDF_PATH"
+          
+          # Copy to the same directory as paper.md
+          cp "$PDF_PATH" paper/paper.pdf
+          echo "✅ PDF copied to paper/paper.pdf"
+          ls -lh paper/paper.pdf
+      
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: paper
-          # This is the output path where Pandoc will write the compiled
-          # PDF. Note, this should be the same directory as the input
-          # paper.md
-          path: paper.pdf
+          path: paper/paper.pdf
