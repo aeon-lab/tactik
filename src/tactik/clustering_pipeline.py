@@ -2,18 +2,26 @@ from typing import Optional, Dict, Any, List
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from .preprocessing import pre_processing_routine, remove_stopwords_corpus, define_stopwords
-from .clustering_tuning import full_clustering_pipeline, full_clustering_pipeline_fixed_params
-from .visualization import plot_clusters, plot_clusters_with_annotations
-from .embeddings import vectorize_text
+try:
+    from .preprocessing import pre_processing_routine, remove_stopwords_corpus, define_stopwords
+    from .clustering_tuning import full_clustering_pipeline, full_clustering_pipeline_fixed_params
+    from .visualization import plot_clusters, plot_clusters_with_annotations
+    from .embeddings import vectorize_text
+except ImportError:
+    from preprocessing import pre_processing_routine, remove_stopwords_corpus, define_stopwords
+    from clustering_tuning import full_clustering_pipeline, full_clustering_pipeline_fixed_params
+    from visualization import plot_clusters, plot_clusters_with_annotations
+    from embeddings import vectorize_text
 
 # Import these at module level so they can be mocked in tests
 try:
     from .topic_extraction import KeywordExtractor, TopicModeler
 except ImportError:
-    # Fallback if module not available
-    KeywordExtractor = None
-    TopicModeler = None
+    try:
+        from topic_extraction import KeywordExtractor, TopicModeler
+    except ImportError:
+        KeywordExtractor = None
+        TopicModeler = None
 
 
 class ClusteringPipeline:
@@ -96,18 +104,27 @@ class ClusteringPipeline:
         
         # Run preprocessing routine
         self.df['processed'], self.df['processed_num_Narr'] = pre_processing_routine(self.df, text_column=self.text_column)
-        # Define and cache stopwords if not already cached
-        if self._stopwords is None:
-            # The define_stopwords function expects a DataFrame with the text column
-            # We need to pass the full dataframe, not just a series
+
+        # Build a key representing the current stopword parameters so we can
+        # detect when the caller has changed them and must recompute the cache
+        stopword_params_key = (
+            tuple(sorted(custom_stopwords or [])),
+            tuple(sorted(keep_words or [])),
+            low_idf,
+            idf_threshold
+        )
+
+        # Recompute stopwords if not yet cached or if parameters have changed
+        if self._stopwords is None or getattr(self, '_stopwords_params_key', None) != stopword_params_key:
             self._stopwords = define_stopwords(
-                self.df,  # Pass the full dataframe
-                text_column='processed_num_Narr',  # Specify which column to use
+                self.df,
+                text_column='processed_num_Narr',
                 custom_stop_words=custom_stopwords or [],
                 custom_keep_words=keep_words or [],
                 low_idf=low_idf,
                 idf_threshold=idf_threshold
             )
+            self._stopwords_params_key = stopword_params_key
         
         # Remove stopwords
         self.df['processed_stopword_Narr'] = remove_stopwords_corpus(

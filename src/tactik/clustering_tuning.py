@@ -400,7 +400,7 @@ def apply_best_clustering(X, best_params, compute_tsne=True, random_state=42):
             raise KeyError(f"best_params is missing required key: '{key}'")
     
     try:
-        # Apply UMAP and HDBSCAN
+        # Apply UMAP and HDBSCAN in a single pass
         umap_params = best_params['umap'].copy()
         hdbscan_params = best_params['hdbscan'].copy()
         
@@ -408,10 +408,13 @@ def apply_best_clustering(X, best_params, compute_tsne=True, random_state=42):
         if 'random_state' not in umap_params:
             umap_params['random_state'] = random_state
         
-        umap_model = UMAP(**umap_params)
-        umap_emb = umap_model.fit_transform(X)
+        # Use _apply_umap_hdbscan as the single source of truth for both
+        # embeddings and cluster labels, avoiding a second independent UMAP fit
+        umap_emb, cluster_labels, hdbscan_model = _apply_umap_hdbscan(X, umap_params, hdbscan_params, random_state=random_state)
         
-        _, cluster_labels, hdbscan_model = _apply_umap_hdbscan(X, umap_params, hdbscan_params, random_state=random_state)
+        # Reconstruct the fitted UMAP model for storage in results
+        umap_model = UMAP(**umap_params)
+        umap_model.fit(X)
         
         # Apply t-SNE on UMAP embeddings for visualization (optional)
         tsne_emb = None

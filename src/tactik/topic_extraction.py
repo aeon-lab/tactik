@@ -26,12 +26,20 @@ import numpy as np
 import logging
 
 
-from .utilities import (
-    calculate_tf_corpus,
-    calculate_tfidf_corpus,
-    calculate_tfdf_corpus,
-    extract_kw_yake_corpus
-)
+try:
+    from .utilities import (
+        calculate_tf_corpus,
+        calculate_tfidf_corpus,
+        calculate_tfdf_corpus,
+        extract_kw_yake_corpus
+    )
+except ImportError:
+    from utilities import (
+        calculate_tf_corpus,
+        calculate_tfidf_corpus,
+        calculate_tfdf_corpus,
+        extract_kw_yake_corpus
+    )
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
