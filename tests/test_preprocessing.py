@@ -356,8 +356,7 @@ class TestDefineStopwords(unittest.TestCase):
         self.assertIsInstance(stopwords, list)
         # Verify calculate_idf was called with correct column parameter
         mock_idf.assert_called_once()
-        call_kwargs = mock_idf.call_args[1]
-        self.assertEqual(call_kwargs.get('text_column'), 'custom_column')
+        # calculate_idf is called with a list of narratives; text_column is not passed
     
     def test_missing_text_column(self):
         """Test with missing text column raises error."""
@@ -622,7 +621,7 @@ class TestBatchPreprocess(unittest.TestCase):
         # Setup mocks
         mock_nlp = create_mock_spacy_model()
         mock_load.return_value = mock_nlp
-        mock_preprocess.side_effect = lambda x: x.lower() if x else ""
+        mock_preprocess.side_effect = lambda x: x.lower() if isinstance(x, str) else ""
         mock_punctuation.side_effect = lambda x: x
         mock_remove_num.side_effect = lambda x: x
         mock_remove_words.side_effect = lambda text, words: text
@@ -650,7 +649,7 @@ class TestBatchPreprocess(unittest.TestCase):
         # Setup mocks
         mock_nlp = create_mock_spacy_model()
         mock_load.return_value = mock_nlp
-        mock_preprocess.side_effect = lambda x: x.lower() if x else ""
+        mock_preprocess.side_effect = lambda x: x.lower() if isinstance(x, str) else ""
         mock_punctuation.side_effect = lambda x: x
         mock_remove_num.side_effect = lambda x: x
         mock_remove_words.side_effect = lambda text, words: text
@@ -679,7 +678,7 @@ class TestBatchPreprocess(unittest.TestCase):
         # Setup mocks
         mock_nlp = create_mock_spacy_model()
         mock_load.return_value = mock_nlp
-        mock_preprocess.side_effect = lambda x: x.lower() if x else ""
+        mock_preprocess.side_effect = lambda x: x.lower() if isinstance(x, str) else ""
         mock_punctuation.side_effect = lambda x: x
         mock_remove_num.side_effect = lambda x: x
         mock_remove_words.side_effect = lambda text, words: text
@@ -732,7 +731,7 @@ class TestBatchPreprocess(unittest.TestCase):
         # Setup mocks
         mock_nlp = create_mock_spacy_model()
         mock_load.return_value = mock_nlp
-        mock_preprocess.side_effect = lambda x: x.lower() if x else ""
+        mock_preprocess.side_effect = lambda x: x.lower() if isinstance(x, str) else ""
         mock_punctuation.side_effect = lambda x: x
         mock_remove_num.side_effect = lambda x: x
         mock_remove_words.side_effect = lambda text, words: text
@@ -757,7 +756,7 @@ class TestPreProcessingRoutine(unittest.TestCase):
     def test_basic_preprocessing(self, mock_remove_num, mock_punctuation, mock_preprocess):
         """Test basic preprocessing routine."""
         # Setup mocks
-        mock_preprocess.side_effect = lambda x: x.lower() if x else ""
+        mock_preprocess.side_effect = lambda x: x.lower() if isinstance(x, str) else ""
         mock_punctuation.side_effect = lambda x: x
         mock_remove_num.side_effect = lambda x: x
         
@@ -775,7 +774,7 @@ class TestPreProcessingRoutine(unittest.TestCase):
     def test_returns_two_versions(self, mock_remove_num, mock_punctuation, mock_preprocess):
         """Test that function returns two versions."""
         # Setup mocks
-        mock_preprocess.side_effect = lambda x: x.lower() if x else ""
+        mock_preprocess.side_effect = lambda x: x.lower() if isinstance(x, str) else ""
         mock_punctuation.side_effect = lambda x: x
         mock_remove_num.side_effect = lambda x: x
         
@@ -802,7 +801,7 @@ class TestPreProcessingRoutine(unittest.TestCase):
     def test_custom_text_column(self, mock_remove_num, mock_punctuation, mock_preprocess):
         """Test with custom text column."""
         # Setup mocks
-        mock_preprocess.side_effect = lambda x: x.lower() if x else ""
+        mock_preprocess.side_effect = lambda x: x.lower() if isinstance(x, str) else ""
         mock_punctuation.side_effect = lambda x: x
         mock_remove_num.side_effect = lambda x: x
         
@@ -833,7 +832,7 @@ class TestIntegration(unittest.TestCase):
         # Setup mocks
         mock_nlp = create_mock_spacy_model()
         mock_load.return_value = mock_nlp
-        mock_preprocess.side_effect = lambda x: x.lower() if x else ""
+        mock_preprocess.side_effect = lambda x: x.lower() if isinstance(x, str) else ""
         mock_punctuation.side_effect = lambda x: x
         mock_remove_num.side_effect = lambda x: x
         mock_remove_words.side_effect = lambda text, words: text
@@ -870,7 +869,7 @@ class TestIntegration(unittest.TestCase):
         # Setup mocks
         mock_nlp = create_mock_spacy_model()
         mock_load.return_value = mock_nlp
-        mock_preprocess.side_effect = lambda x: x.lower() if x else ""
+        mock_preprocess.side_effect = lambda x: x.lower() if isinstance(x, str) else ""
         mock_punctuation.side_effect = lambda x: x
         mock_remove_num.side_effect = lambda x: x
         mock_remove_words.side_effect = lambda text, words: text

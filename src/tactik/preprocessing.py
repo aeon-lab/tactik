@@ -6,14 +6,24 @@ import re
 from tqdm import tqdm
 import spacy
 from spacy.lang.en.stop_words import STOP_WORDS
-from .utilities import (
-    preprocess_text, 
-    handle_punctuation, 
-    remove_num, 
-    remove_words_dict,
-    calculate_idf,
-    spacy_tokenizer
-)
+try:
+    from .utilities import (
+        preprocess_text, 
+        handle_punctuation, 
+        remove_num, 
+        remove_words_dict,
+        calculate_idf,
+        spacy_tokenizer
+    )
+except ImportError:
+    from utilities import (
+        preprocess_text, 
+        handle_punctuation, 
+        remove_num, 
+        remove_words_dict,
+        calculate_idf,
+        spacy_tokenizer
+    )
 _cached_models = {}
 
 def pre_processing_routine(SDRS, text_column="Narrative_long"):
@@ -214,7 +224,7 @@ def define_stopwords(SDRS,
                 print(f"Warning: No valid data in column '{text_column}' for IDF calculation. Skipping low IDF stopwords.")
             else:
                 # Call calculate_idf with the list of narratives (not DataFrame)
-                idf_results = calculate_idf(narratives_list, text_column=text_column)
+                idf_results = calculate_idf(narratives_list)
                 
                 # Filter words below threshold
                 low_idf_stopwords = [word for (IDF, word) in idf_results 

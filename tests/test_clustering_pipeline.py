@@ -669,7 +669,7 @@ class TestTopicAnalysis(BaseTestCase):
         self.assertEqual(result['cluster_topics'], mock_cluster_topics)
         
         # Check modeler was called correctly
-        mock_modeler.train_lda.assert_called_once_with(num_topics=10, passes=20)
+        mock_modeler.train_lda.assert_called_once_with(num_topics=10, passes=20, random_state=42)
     
     @patch('clustering_pipeline.TopicModeler')
     def test_analyze_topics_creates_tokens_if_missing(self, mock_modeler_class):
