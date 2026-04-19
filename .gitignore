@@ -38,7 +38,7 @@ htmlcov/
 # --- Jupyter and notebooks ---
 
 .ipynb_checkpoints/
-*.ipynb
+
 
 # --- IDE and editor files ---
 
@@ -59,13 +59,6 @@ Desktop.ini
 *.pyd
 *.pdb
 
-# --- Optional: data or model outputs (if not part of package) ---
-
-/data/
-*.h5
-*.pkl
-*.csv
-*.json
 
 # --- Keep project metadata ---
 
