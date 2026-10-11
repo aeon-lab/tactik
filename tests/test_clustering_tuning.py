@@ -237,7 +237,7 @@ class TestTuneClusteringHyperparameters(unittest.TestCase):
             self.assertEqual(result['best_params']['umap']['min_dist'], 0.1)
     
     def test_tsne_tuning_enabled(self):
-        """Test with t-SNE tuning enabled."""
+        """Reject t-SNE tuning because the objective never evaluates it."""
         X, y = make_blobs(n_samples=200, centers=3, random_state=42)
         
         custom_tsne_grid = {
@@ -246,16 +246,14 @@ class TestTuneClusteringHyperparameters(unittest.TestCase):
             'early_exaggeration': [12]
         }
         
-        result = ct.tune_clustering_hyperparameters(
-            X=X,
-            tune_tsne=True,
-            tsne_param_grid=custom_tsne_grid,
-            max_iterations=5,
-            progress=False
-        )
-        
-        tsne_params = [h['params']['tsne'] for h in result['history'] if h.get('params')]
-        self.assertGreater(len(tsne_params), 0)
+        with self.assertRaisesRegex(ValueError, 'tune_tsne is unsupported'):
+            ct.tune_clustering_hyperparameters(
+                X=X,
+                tune_tsne=True,
+                tsne_param_grid=custom_tsne_grid,
+                max_iterations=5,
+                progress=False
+            )
     
     def test_tsne_tuning_disabled(self):
         """Test with fixed t-SNE parameters."""
@@ -1047,8 +1045,8 @@ class TestWinningFitRegression(unittest.TestCase):
         # Force the later trial to win while fitting real UMAP/HDBSCAN models.
         with patch.object(ct, '_apply_umap_hdbscan', side_effect=capture_fit), \
                 patch.object(ct, 'evaluate_clustering_quality', side_effect=[
-                    {'davies_bouldin': 2.0, 'n_clusters': 3},
-                    {'davies_bouldin': 1.0, 'n_clusters': 3}]):
+                    {'davies_bouldin': 2.0, 'n_clusters': 3, 'coverage': 1.0},
+                    {'davies_bouldin': 1.0, 'n_clusters': 3, 'coverage': 1.0}]):
             tuned = ct.tune_clustering_hyperparameters(
                 X, umap_param_grid={'n_neighbors': [8], 'n_components': [2],
                                    'n_epochs': [30], 'metric': ['euclidean']},
@@ -1075,8 +1073,8 @@ class TestWinningFitRegression(unittest.TestCase):
         with patch.object(ct, 'UMAP', side_effect=make_umap) as umap_factory, \
                 patch.object(ct.hdbscan, 'HDBSCAN', return_value=clusterer), \
                 patch.object(ct, 'evaluate_clustering_quality', side_effect=[
-                    {'davies_bouldin': 2.0, 'n_clusters': 2},
-                    {'davies_bouldin': 1.0, 'n_clusters': 2}]):
+                    {'davies_bouldin': 2.0, 'n_clusters': 2, 'coverage': 1.0},
+                    {'davies_bouldin': 1.0, 'n_clusters': 2, 'coverage': 1.0}]):
             tuned = ct.tune_clustering_hyperparameters(
                 X, umap_param_grid={'n_neighbors': [3], 'n_components': [2]},
                 hdbscan_param_grid={'metric': ['euclidean'], 'min_cluster_size': [2]},
@@ -1098,7 +1096,7 @@ class TestWinningFitRegression(unittest.TestCase):
         with patch.object(ct, '_apply_umap_hdbscan', return_value=(
                 np.zeros((6, 2)), np.array([0, 0, 0, 1, 1, 1]), Mock(), Mock())), \
                 patch.object(ct, 'evaluate_clustering_quality', return_value={
-                    'davies_bouldin': 1.0, 'n_clusters': 2}):
+                    'davies_bouldin': 1.0, 'n_clusters': 2, 'coverage': 1.0}):
             result = ct.tune_clustering_hyperparameters(
                 np.zeros((6, 4)), umap_param_grid={'random_state': [0]},
                 hdbscan_param_grid={'metric': ['euclidean']},

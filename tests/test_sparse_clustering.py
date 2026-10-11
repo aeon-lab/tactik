@@ -66,7 +66,8 @@ class TestSparsePipelineStorage(unittest.TestCase):
                             patch.object(ct, 'pairwise_distances') as distances, \
                             patch.object(ct, 'TSNE') as tsne, \
                             patch.object(ct, 'evaluate_clustering_quality', return_value={
-                                'davies_bouldin': 1., 'n_clusters': 2}):
+                                'davies_bouldin': 1., 'n_clusters': 2,
+                                'coverage': 1.0}):
                         options = dict(standardize=standardize, compute_tsne=False, progress=False)
                         if tune:
                             result = ct.full_clustering_pipeline(
