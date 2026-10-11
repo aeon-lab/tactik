@@ -1,14 +1,13 @@
 # Include top-level files
-include README.md
-include LICENSE
+include readme.md
+include license.txt
 include pyproject.toml
 
-# Include everything in docs and examples folders
-recursive-include docs *
+# Include examples
 recursive-include examples *
 
 # Include all text and CSV files inside your package
-recursive-include myawesomepkg *.txt *.csv
+recursive-include src/tactik *.txt *.csv
 
 # Exclude compiled or cache files
-global-exclude *.pyc *.pyo __pycache__ *
+global-exclude *.pyc *.pyo

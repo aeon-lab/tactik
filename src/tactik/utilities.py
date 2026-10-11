@@ -7,11 +7,12 @@ import pandas as pd
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 import yake
 import spacy
+from spacy.lang.en.stop_words import STOP_WORDS
 import heapq
 
 # Load Spacy model (assuming it's needed for spacy_tokenizer)
 
-stopwords = spacy.lang.en.stop_words.STOP_WORDS
+stopwords = STOP_WORDS
 punctuations = string.punctuation
 _RE_COMBINE_WHITESPACE = re.compile(r"\s+")
 _RE_DIGITS = re.compile(r"\d")
@@ -26,7 +27,8 @@ _cached_models = {}
 def load_spacy_model(
     model_name="en_core_web_sm",
     disable_pipes=None,
-    use_cache=True
+    use_cache=True,
+    auto_download=False,
 ):
     """
     Load a spaCy language model with optional pipe disabling and caching.
@@ -39,6 +41,9 @@ def load_spacy_model(
         Pipeline components to disable for faster processing (default: ['ner']).
     use_cache : bool
         Whether to return cached model if available (default: True).
+    auto_download : bool
+        Download the model when it is missing. Disabled by default to avoid
+        unexpected network access; install the model explicitly or opt in.
 
     Returns
     -------
@@ -57,7 +62,12 @@ def load_spacy_model(
 
     try:
         nlp = spacy.load(model_name)
-    except OSError:
+    except OSError as missing_model_error:
+        if not auto_download:
+            raise OSError(
+                f"spaCy model '{model_name}' is not installed. Install it with "
+                f"'python -m spacy download {model_name}' or pass auto_download=True."
+            ) from missing_model_error
         logging.info(f"Model '{model_name}' not found. Attempting to download...")
         subprocess.run([sys.executable, "-m", "spacy", "download", model_name], check=True)
         nlp = spacy.load(model_name)
@@ -70,9 +80,18 @@ def load_spacy_model(
     if disable_pipes:
         nlp.disable_pipes(*disable_pipes)
 
-    _cached_models[key] = nlp
+    if use_cache:
+        _cached_models[key] = nlp
     logging.info(f"Loaded spaCy model '{model_name}' with active pipes: {nlp.pipe_names}")
     return nlp
+
+
+def clear_spacy_cache():
+    """Release all spaCy models cached by :func:`load_spacy_model`."""
+    count = len(_cached_models)
+    _cached_models.clear()
+    logging.info("Cleared %d cached spaCy model(s)", count)
+    return count
 
 def extract_features(narrative, n=3):
     '''
@@ -225,9 +244,16 @@ def calculate_mean_tf(tf_Frame):
         Keys: unique words (str) from all input documents
         Values: mean TF scores (float) across all documents
     """
-    DF = pd.DataFrame(tf_Frame)
-    DF.fillna(0, inplace=True)
-    return dict(DF.mean(numeric_only=True))
+    document_count = len(tf_Frame)
+    if document_count == 0:
+        return {}
+
+    # Accumulate only observed terms instead of allocating a dense
+    # documents-by-vocabulary DataFrame.
+    totals = Counter()
+    for document_tf in tf_Frame:
+        totals.update(document_tf)
+    return {term: total / document_count for term, total in totals.items()}
     
 def handle_punctuation(narrative):
     """Add spaces after punctuation marks for better tokenization.
@@ -305,7 +331,7 @@ def preprocess_text(narrative):
     narrative : str
         The input text narrative to be preprocessed. Can contain any combination
         of letters, numbers, punctuation, and whitespace characters. Empty
-        strings are handled gracefully and return empty strings.
+        strings and missing values (None, NaN, pandas.NA) return empty strings.
     
     Returns
     -------
@@ -319,7 +345,16 @@ def preprocess_text(narrative):
         
         If the input consists entirely of punctuation, numbers, and whitespace,
         an empty string will be returned.
+
+    Raises
+    ------
+    ValueError
+        If the input is neither a string nor a missing scalar value.
     """
+    if narrative is None or (pd.api.types.is_scalar(narrative) and pd.isna(narrative)):
+        return ""
+    if not isinstance(narrative, str):
+        raise ValueError("Narrative must be a string or a missing value")
     narrative = narrative.translate(str.maketrans('', '', punctuations))
     narrative = _RE_DIGITS.sub(" ", narrative)
     narrative = _RE_COMBINE_WHITESPACE.sub(" ", narrative).strip()
@@ -427,7 +462,7 @@ def get_max_n_dict(dic,n):
         # Use sorting approach for small dictionaries or when n is large relative to dict_size
         return {key: dic[key] for key in sorted(dic, key=dic.get, reverse=True)[:n]}
 
-def calculate_tf_corpus(corpus,n):
+def calculate_tf_corpus(corpus, n, *, tf_documents=None, mean_tf=None):
     """Calculate the top n Term Frequency (TF) scores for an entire corpus of documents.
     
     This internal utility function provides a streamlined way to find the most 
@@ -451,11 +486,11 @@ def calculate_tf_corpus(corpus,n):
         A dictionary containing the top n terms and their mean TF scores,
         ordered by TF score in descending order (highest to lowest).
     """
-    D = calculate_tf(corpus)
-    g = calculate_mean_tf(D)
+    D = calculate_tf(corpus) if tf_documents is None else tf_documents
+    g = calculate_mean_tf(D) if mean_tf is None else mean_tf
     return get_max_n_dict(g,n)
 
-def calculate_tfidf_corpus(corpus, n):
+def calculate_tfidf_corpus(corpus, n, *, tf_documents=None, idf_scores=None):
     """
     Calculate the top n TF-IDF (Term Frequency-Inverse Document Frequency) scores for an entire corpus.
     
@@ -497,9 +532,10 @@ def calculate_tfidf_corpus(corpus, n):
     
     """
    
-    idf_scores = calculate_idf(corpus)
-    
-    tf_documents = calculate_tf(corpus)
+    if idf_scores is None:
+        idf_scores = calculate_idf(corpus)
+    if tf_documents is None:
+        tf_documents = calculate_tf(corpus)
     
     idf_dict = {word: idf_score for idf_score, word in idf_scores}
     
@@ -516,26 +552,22 @@ def calculate_tfidf_corpus(corpus, n):
     
     return get_max_n_dict(mean_tfidf, n)
 
-def calculate_tfdf_corpus(corpus, n):
+def calculate_tfdf_corpus(corpus, n, *, tf_documents=None, mean_tf=None):
     """
-    Calculate top n TF*DF (Term Frequency / Document Frequency) scores for the entire corpus.
-    
-    TF/DF is a text analysis metric where:
-    - TF (Term Frequency): How often a term appears in a document
-    - DF (Document Frequency): How many documents contain the term
-    - TF*DF product: Higher values indicate terms that appear frequently in many documents
-    
-    This metric helps identify terms that are characteristic of specific documents
-    rather than common across the entire corpus (opposite of TF-IDF behavior).
+    Calculate the top n mean-TF times document-frequency scores.
+
+    TF is the term count divided by the document's word count, averaged over
+    all documents (including empty documents and documents missing the term).
+    DF is the number of documents containing the term, counted once per
+    document. Their product favors terms frequent across many documents,
+    unlike TF-IDF, which downweights widespread terms.
     
     Parameters:
     -----------
-    corpus : list of str or list of dict
-        Collection of documents to analyze. Can be:
-        - List of strings (raw text documents)
-        - List of dictionaries (pre-processed term frequencies)
+    corpus : iterable of str
+        Raw documents; tokens are split on whitespace and lowercased.
     n : int
-        Number of top TF/DF scores to return
+        Number of top TF*DF scores to return
         
     Returns:
     --------
@@ -546,25 +578,14 @@ def calculate_tfdf_corpus(corpus, n):
 
     """
 
-    df_values = calculate_idf(corpus)  
-    tf_dicts = calculate_tf(corpus)    
-
-    all_tfdf_scores = []
-    
+    tf_dicts = calculate_tf(corpus) if tf_documents is None else tf_documents
+    document_frequency = Counter()
     for doc_tf in tf_dicts:
-        doc_tfdf = {}
-        for df, word in df_values:
-            if word in doc_tf:
-                tf = doc_tf[word]
-                doc_tfdf[word] = tf * df
-        if doc_tfdf:  
-            all_tfdf_scores.append(doc_tfdf)
-    
-    if all_tfdf_scores:
-        mean_scores = calculate_mean_tf(all_tfdf_scores)
-        return get_max_n_dict(mean_scores, n)
-    else:
-        return {}
+        document_frequency.update(doc_tf.keys())
+
+    mean_tf = calculate_mean_tf(tf_dicts) if mean_tf is None else mean_tf
+    scores = {word: tf * document_frequency[word] for word, tf in mean_tf.items()}
+    return get_max_n_dict(scores, n)
     
 def extract_kw_yake_corpus(corpus, N, N2, ngram_size=1, dedupe_threshold=0.9):
     """
@@ -645,7 +666,8 @@ def extract_kw_yake_corpus(corpus, N, N2, ngram_size=1, dedupe_threshold=0.9):
     
     return get_max_n_dict(mean_scores, N2)
 
-def spacy_tokenizer(narrative):
+def spacy_tokenizer(narrative, nlp_model=None, custom_stopwords=None,
+                    remove_punctuation=True, min_token_length=2):
     """
     Tokenize text using Spacy with lemmatization and stopword removal.
     
@@ -666,6 +688,15 @@ def spacy_tokenizer(narrative):
         Input text to be tokenized and processed. Should be a string containing
         natural language text. Empty strings and None values should be handled
         by the calling code.
+    nlp_model : callable, optional
+        Loaded spaCy model. Falls back to the module's legacy ``nlp`` variable
+        if available; otherwise raises RuntimeError without downloading a model.
+    custom_stopwords : iterable of str, optional
+        Stopwords to remove. Defaults to the model's stopwords.
+    remove_punctuation : bool, optional
+        Skip punctuation and whitespace tokens before lemmatization.
+    min_token_length : int, optional
+        Minimum length of retained alphabetic lemmas (default 2).
         
     Returns:
     --------
@@ -682,10 +713,9 @@ def spacy_tokenizer(narrative):
     
     
     if nlp_model is None:
-        try:
-            nlp_model = nlp  # Try to use global nlp
-        except NameError:
-            raise RuntimeError("No spacy model provided and global 'nlp' not found")
+        nlp_model = globals().get('nlp')
+        if nlp_model is None:
+            raise RuntimeError("No spaCy model provided. Pass a loaded model as nlp_model.")
     
     if custom_stopwords is None:
         # Use spacy's built-in stopwords if available
@@ -705,7 +735,7 @@ def spacy_tokenizer(narrative):
             if remove_punctuation and (token.is_punct or token.is_space):
                 continue
                 
-            if token.is_stop and token.lower_ in custom_stopwords:
+            if token.lower_ in custom_stopwords:
                 continue
             
             # Get lemmatized form
@@ -829,7 +859,7 @@ def calculate_word_length_distribution(narratives):
                 length_dist[len(word)] += 1
     return dict(length_dist)
 
-def extract_most_common_pos_tags(narratives, top_n=10):
+def extract_most_common_pos_tags(narratives, top_n=10, nlp_model=None):
     """
     Extract the most common part-of-speech tags from a collection of narratives.
     
@@ -848,6 +878,9 @@ def extract_most_common_pos_tags(narratives, top_n=10):
         Collection of text documents to analyze
     top_n : int, optional (default=10)
         Number of most common POS tags to return (must be positive)
+    nlp_model : callable, optional
+        Loaded spaCy model. Falls back to the module's legacy ``nlp`` variable
+        if available; otherwise raises RuntimeError without downloading a model.
     
     Returns:
     --------
@@ -878,11 +911,9 @@ def extract_most_common_pos_tags(narratives, top_n=10):
     
     
     if nlp_model is None:
-        try:
-            # Assumes 'nlp' is a globally available spaCy model object
-            nlp_model = nlp  
-        except NameError:
-            raise RuntimeError("No spaCy model provided and global 'nlp' variable not found")
+        nlp_model = globals().get('nlp')
+        if nlp_model is None:
+            raise RuntimeError("No spaCy model provided. Pass a loaded model as nlp_model.")
     
     
     if not hasattr(nlp_model, '__call__') or not hasattr(nlp_model, 'vocab'):

@@ -1,5 +1,7 @@
 # test_clustering_tuning.py
 import unittest
+import random
+from unittest.mock import Mock, patch
 import numpy as np
 from sklearn.datasets import make_blobs, make_moons
 import clustering_tuning as ct
@@ -24,6 +26,7 @@ class TestEvaluateClusteringQuality(unittest.TestCase):
         self.assertEqual(metrics['n_clusters'], 3)
         self.assertEqual(metrics['n_noise'], 0)
         self.assertEqual(metrics['noise_ratio'], 0.0)
+        self.assertEqual(metrics['coverage'], 1.0)
         self.assertLess(metrics['davies_bouldin'], float('inf'))
         self.assertGreater(metrics['calinski_harabasz'], float('-inf'))
     
@@ -37,6 +40,7 @@ class TestEvaluateClusteringQuality(unittest.TestCase):
         self.assertEqual(metrics['n_clusters'], 2)
         self.assertEqual(metrics['n_noise'], 30)
         self.assertEqual(metrics['noise_ratio'], 0.3)
+        self.assertAlmostEqual(metrics['coverage'], 0.7)
     
     def test_all_noise_points(self):
         """Test when all points are classified as noise."""
@@ -130,6 +134,19 @@ class TestRandomParameterCombination(unittest.TestCase):
         
         self.assertGreater(len(set(results)), 1)
 
+    def test_random_state_is_reproducible_without_global_side_effects(self):
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        grid = {'a': list(range(10)), 'b': list(range(5))}
+        first = ct.random_parameter_combination(grid, random_state=123)
+        second = ct.random_parameter_combination(grid, random_state=123)
+        self.assertEqual(first, second)
+        self.assertEqual(random.getstate(), python_state)
+        current_numpy_state = np.random.get_state()
+        self.assertEqual(current_numpy_state[0], numpy_state[0])
+        np.testing.assert_array_equal(current_numpy_state[1], numpy_state[1])
+        self.assertEqual(current_numpy_state[2:], numpy_state[2:])
+
 
 class TestTuneClusteringHyperparameters(unittest.TestCase):
     """Tests for tune_clustering_hyperparameters function."""
@@ -147,6 +164,7 @@ class TestTuneClusteringHyperparameters(unittest.TestCase):
         
         self.assertIn('best_params', result)
         self.assertIn('best_score', result)
+        self.assertIn('best_metrics', result)
         self.assertIn('history', result)
         self.assertIn('total_time', result)
         self.assertIn('iterations_completed', result)
@@ -575,18 +593,40 @@ class TestFullClusteringPipeline(unittest.TestCase):
         if result['success']:
             self.assertEqual(result['tuning_results']['best_params']['tsne'], custom_tsne)
     
-    def test_tune_tsne_enabled(self):
-        """Test pipeline with t-SNE tuning enabled."""
+    def test_tune_tsne_enabled_is_rejected(self):
+        """t-SNE settings must not be presented as tuned without evaluation."""
         X, y = make_blobs(n_samples=200, centers=3, random_state=42)
-        
-        result = ct.full_clustering_pipeline(
-            X=X,
-            max_iterations=5,
-            tune_tsne=True,
-            progress=False
+        with self.assertRaisesRegex(ValueError, "tune_tsne is unsupported"):
+            ct.full_clustering_pipeline(X=X, max_iterations=5, tune_tsne=True, progress=False)
+
+    def test_min_coverage_rejects_invalid_values(self):
+        X = np.ones((10, 2))
+        with self.assertRaisesRegex(ValueError, "min_coverage"):
+            ct.tune_clustering_hyperparameters(X, min_coverage=1.1)
+
+    @patch('clustering_tuning._apply_umap_hdbscan')
+    def test_min_coverage_excludes_low_coverage_candidate(self, mock_cluster):
+        X = np.zeros((10, 2))
+        embedding = np.array([[0., 0.], [0., 1.], [1., 0.], [1., 1.],
+                              [10., 10.], [10., 11.], [11., 10.], [11., 11.],
+                              [5., 5.], [6., 6.]])
+        mock_cluster.return_value = (
+            embedding, np.array([0, 0, 0, 0, 1, 1, 1, 1, -1, -1]), None, None
         )
-        
-        self.assertIsNotNone(result['tuning_results'])
+
+        result = ct.tune_clustering_hyperparameters(
+            X, umap_param_grid={'n_neighbors': [2]},
+            hdbscan_param_grid={'min_cluster_size': [2]},
+            min_clusters=2, min_coverage=0.9, max_iterations=1
+        )
+
+        self.assertIsNone(result['best_params'])
+        self.assertEqual(result['history'][0]['metrics']['coverage'], 0.8)
+
+    def test_tsne_grid_is_rejected(self):
+        X = np.ones((10, 2))
+        with self.assertRaisesRegex(ValueError, "tsne_param_grid is unsupported"):
+            ct.tune_clustering_hyperparameters(X, tsne_param_grid={'perplexity': [10]})
     
     def test_different_target_metrics(self):
         """Test pipeline with different optimization metrics."""
@@ -660,11 +700,12 @@ class TestDefaultParameterGrids(unittest.TestCase):
         self.assertTrue(all(isinstance(v, list) for v in ct.DEFAULT_UMAP_GRID.values()))
     
     def test_default_hdbscan_grid_valid(self):
-        """Test that default HDBSCAN grid is valid."""
+        """Default tuning should avoid HDBSCAN's quadratic cosine path."""
         self.assertIn('min_cluster_size', ct.DEFAULT_HDBSCAN_GRID)
         self.assertIn('metric', ct.DEFAULT_HDBSCAN_GRID)
         self.assertIn('cluster_selection_method', ct.DEFAULT_HDBSCAN_GRID)
         self.assertTrue(all(isinstance(v, list) for v in ct.DEFAULT_HDBSCAN_GRID.values()))
+        self.assertEqual(ct.DEFAULT_HDBSCAN_GRID['metric'], ['euclidean'])
     
     def test_default_tsne_params_valid(self):
         """Test that default t-SNE params are valid."""
@@ -990,6 +1031,85 @@ class TestParameterValidation(unittest.TestCase):
         )
         
         self.assertLess(result['total_time'], 5)
+
+
+class TestWinningFitRegression(unittest.TestCase):
+    def test_real_models_reproduce_later_trial(self):
+        X, _ = make_blobs(n_samples=60, centers=3, n_features=4, random_state=7)
+        trial_fits = []
+        apply_models = ct._apply_umap_hdbscan
+
+        def capture_fit(*args, **kwargs):
+            result = apply_models(*args, **kwargs)
+            trial_fits.append(result)
+            return result
+
+        # Force the later trial to win while fitting real UMAP/HDBSCAN models.
+        with patch.object(ct, '_apply_umap_hdbscan', side_effect=capture_fit), \
+                patch.object(ct, 'evaluate_clustering_quality', side_effect=[
+                    {'davies_bouldin': 2.0, 'n_clusters': 3},
+                    {'davies_bouldin': 1.0, 'n_clusters': 3}]):
+            tuned = ct.tune_clustering_hyperparameters(
+                X, umap_param_grid={'n_neighbors': [8], 'n_components': [2],
+                                   'n_epochs': [30], 'metric': ['euclidean']},
+                hdbscan_param_grid={'metric': ['euclidean'], 'min_cluster_size': [3]},
+                tsne_params={'perplexity': 5}, min_clusters=2, max_iterations=2)
+        applied = ct.apply_best_clustering(X, tuned['best_params'], compute_tsne=False)
+        np.testing.assert_array_equal(applied['umap_embeddings'], trial_fits[1][0])
+        np.testing.assert_array_equal(applied['clusters'], trial_fits[1][1])
+        self.assertIs(applied['umap_model'].embedding_, applied['umap_embeddings'])
+
+    def test_later_winner_preserves_seed_and_returns_original_fitted_model(self):
+        X = np.arange(24).reshape(6, 4)
+        models = []
+
+        def make_umap(**params):
+            model = Mock()
+            model.embedding_ = np.random.default_rng(params['random_state']).normal(size=(6, 2))
+            model.fit_transform.return_value = model.embedding_
+            models.append(model)
+            return model
+
+        clusterer = Mock(labels_=np.array([0, 0, 0, 1, 1, 1]))
+        clusterer.fit.return_value = clusterer
+        with patch.object(ct, 'UMAP', side_effect=make_umap) as umap_factory, \
+                patch.object(ct.hdbscan, 'HDBSCAN', return_value=clusterer), \
+                patch.object(ct, 'evaluate_clustering_quality', side_effect=[
+                    {'davies_bouldin': 2.0, 'n_clusters': 2},
+                    {'davies_bouldin': 1.0, 'n_clusters': 2}]):
+            tuned = ct.tune_clustering_hyperparameters(
+                X, umap_param_grid={'n_neighbors': [3], 'n_components': [2]},
+                hdbscan_param_grid={'metric': ['euclidean'], 'min_cluster_size': [2]},
+                tsne_params={'perplexity': 2}, min_clusters=2,
+                max_iterations=2, random_state=42)
+            applied = ct.apply_best_clustering(X, tuned['best_params'], compute_tsne=False)
+
+        self.assertEqual(tuned['best_params']['umap']['random_state'], 43)
+        self.assertEqual(tuned['history'][1]['params']['umap']['random_state'], 43)
+        self.assertEqual(umap_factory.call_count, 3)  # Two trials, one final fit.
+        np.testing.assert_array_equal(applied['umap_embeddings'], models[1].embedding_)
+        self.assertIs(applied['umap_model'], models[2])
+        self.assertIs(applied['umap_embeddings'], models[2].embedding_)
+        for model in models:
+            model.fit_transform.assert_called_once_with(X)
+            model.fit.assert_not_called()
+
+    def test_explicit_grid_seed_is_preserved(self):
+        with patch.object(ct, '_apply_umap_hdbscan', return_value=(
+                np.zeros((6, 2)), np.array([0, 0, 0, 1, 1, 1]), Mock(), Mock())), \
+                patch.object(ct, 'evaluate_clustering_quality', return_value={
+                    'davies_bouldin': 1.0, 'n_clusters': 2}):
+            result = ct.tune_clustering_hyperparameters(
+                np.zeros((6, 4)), umap_param_grid={'random_state': [0]},
+                hdbscan_param_grid={'metric': ['euclidean']},
+                tsne_params={'perplexity': 2}, min_clusters=2, max_iterations=1)
+        self.assertEqual(result['best_params']['umap']['random_state'], 0)
+
+    def test_zero_seed_is_not_replaced_with_default(self):
+        with patch.object(ct, 'UMAP') as umap_factory, \
+                patch.object(ct.hdbscan, 'HDBSCAN'):
+            ct._apply_umap_hdbscan(np.zeros((6, 4)), {}, {'metric': 'euclidean'}, random_state=0)
+        self.assertEqual(umap_factory.call_args.kwargs['random_state'], 0)
 
 
 if __name__ == '__main__':

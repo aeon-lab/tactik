@@ -273,20 +273,28 @@ class TestTopicModeler(unittest.TestCase):
             modeler = TopicModeler(self.sample_texts, self.sample_clusters, use_gpu=False)
             self.assertEqual(modeler.device.type, 'cpu')
     
-    def test_default_designators(self):
-        """Test that default designators are comprehensive."""
+    def test_default_designators_are_domain_neutral(self):
+        """Generic topic modeling should not silently use aviation labels."""
         modeler = TopicModeler(self.sample_texts, self.sample_clusters)
-        designators = modeler.designators
-        
-        self.assertIsInstance(designators, dict)
-        self.assertGreater(len(designators), 5)  # Should have multiple designators
-        
-        # Check for key designator categories
-        designator_names = list(designators.keys())
-        has_knowledge = any('knowledge' in name.lower() for name in designator_names)
-        has_judgment = any('judgment' in name.lower() or 'decision' in name.lower() for name in designator_names)
-        
-        self.assertTrue(has_knowledge or has_judgment)
+        self.assertEqual(modeler.designators, {})
+
+    def test_aviation_designator_profile_is_explicit(self):
+        modeler = TopicModeler(
+            self.sample_texts, self.sample_clusters, designator_profile='aviation'
+        )
+        self.assertGreater(len(modeler.designators), 5)
+
+    @patch.object(TopicModeler, 'get_bert_embedding')
+    def test_no_designators_returns_unmatched_topics(self, mock_get_embedding):
+        mock_get_embedding.return_value = np.ones((1, 768))
+        modeler = TopicModeler(self.sample_texts, self.sample_clusters)
+        modeler.train_lda(num_topics=2, passes=2)
+
+        matches = modeler.match_designators_to_topics()
+
+        self.assertEqual(matches, {0: [], 1: []})
+        self.assertTrue(all(not item['matched'] for item in modeler.topic_match_metadata.values()))
+        self.assertTrue(all(item['best_similarity'] is None for item in modeler.topic_match_metadata.values()))
     
     def test_prepare_corpus(self):
         """Test corpus preparation."""

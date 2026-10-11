@@ -1,12 +1,14 @@
 import random
 import time
 import numpy as np
+from scipy.sparse import issparse
 from sklearn.metrics import davies_bouldin_score, calinski_harabasz_score
 from sklearn.metrics import pairwise_distances
-from umap import UMAP
 import hdbscan
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
+
+UMAP = None
 
 # Default parameter grids
 DEFAULT_UMAP_GRID = {
@@ -18,9 +20,49 @@ DEFAULT_UMAP_GRID = {
 
 DEFAULT_HDBSCAN_GRID = {
     'min_cluster_size': [10, 15, 20, 25],
-    'metric': ['cityblock', 'cosine', 'euclidean', 'l1', 'l2', 'manhattan'],
+    'metric': ['euclidean'],
     'cluster_selection_method': ['eom', 'leaf']
 }
+
+# Limit the distance matrix itself, not total HDBSCAN working memory.
+DEFAULT_MAX_PAIRWISE_MEMORY_MB = 512
+
+
+def _validate_clustering_input(X):
+    """Accept dense or sparse 2D features without materializing sparse zeros."""
+    if X is None:
+        raise ValueError("Input data X cannot be None or empty")
+    if not issparse(X):
+        X = np.asarray(X)
+    if X.ndim != 2 or X.shape[0] == 0 or X.shape[1] == 0:
+        raise ValueError("Input data X cannot be empty and must be a 2D feature matrix")
+    return X
+
+
+def _prepare_clustering_input(X, standardize):
+    """Copy features once; scale sparse input without centering or densifying."""
+    X = _validate_clustering_input(X)
+    X_processed = X.tocsr(copy=True) if issparse(X) else X.copy()
+    scaler = None
+    if standardize:
+        scaler = StandardScaler(with_mean=not issparse(X_processed), copy=False)
+        X_processed = scaler.fit_transform(X_processed)
+    return X_processed, scaler
+
+
+def _check_pairwise_memory(n_samples, max_pairwise_memory_mb):
+    """Reject oversized float64 cosine distance matrices before allocation."""
+    if not np.isfinite(max_pairwise_memory_mb) or max_pairwise_memory_mb <= 0:
+        raise ValueError("max_pairwise_memory_mb must be a positive finite number")
+    required_bytes = int(n_samples) ** 2 * np.dtype(np.float64).itemsize
+    required_mb = required_bytes / 1024 ** 2
+    if required_mb > max_pairwise_memory_mb:
+        raise MemoryError(
+            f"Cosine HDBSCAN requires a distance matrix of at least {required_mb:.1f} MiB "
+            f"for {n_samples} samples (limit: {max_pairwise_memory_mb:g} MiB). "
+            "HDBSCAN needs additional working memory. Use hdbscan_metric='euclidean' "
+            "or explicitly increase max_pairwise_memory_mb."
+        )
 
 DEFAULT_TSNE_PARAMS = {
     'perplexity': 30,
@@ -60,6 +102,7 @@ def evaluate_clustering_quality(clusters, X):
             - 'n_clusters' (int): Number of unique clusters (excluding noise).
             - 'n_noise' (int): Number of noise points.
             - 'noise_ratio' (float): Ratio of noise points to total points.
+            - 'coverage' (float): Fraction of documents assigned to a cluster.
     
     Raises:
         ValueError: If clusters and X have mismatched dimensions.
@@ -73,6 +116,7 @@ def evaluate_clustering_quality(clusters, X):
             'n_clusters': 0,
             'n_noise': 0,
             'noise_ratio': 0.0,
+            'coverage': 0.0,
             'davies_bouldin': float('inf'),
             'calinski_harabasz': float('-inf')
         }
@@ -82,7 +126,8 @@ def evaluate_clustering_quality(clusters, X):
         'calinski_harabasz': float('-inf'),
         'n_clusters': 0,
         'n_noise': 0,
-        'noise_ratio': 0.0
+        'noise_ratio': 0.0,
+        'coverage': 0.0
     }
     
     # Filter out noise points (label = -1)
@@ -93,6 +138,7 @@ def evaluate_clustering_quality(clusters, X):
     # Calculate noise statistics
     metrics['n_noise'] = int(np.sum(~mask))
     metrics['noise_ratio'] = float(metrics['n_noise'] / len(clusters))
+    metrics['coverage'] = 1.0 - metrics['noise_ratio']
     metrics['n_clusters'] = len(np.unique(clusters_filtered))
     
     # Need at least 2 clusters for meaningful metrics
@@ -122,14 +168,12 @@ def random_parameter_combination(param_grid, random_state=None):
     Returns:
         dict: Dictionary with the same keys as param_grid, with randomly selected values.
     """
-    if random_state is not None:
-        np.random.seed(random_state)
-        random.seed(random_state)
-    
-    return {key: random.choice(value) for key, value in param_grid.items()}
+    rng = random if random_state is None else random.Random(random_state)
+    return {key: rng.choice(value) for key, value in param_grid.items()}
 
 
-def _apply_umap_hdbscan(X, umap_params, hdbscan_params, random_state=None):
+def _apply_umap_hdbscan(X, umap_params, hdbscan_params, random_state=None,
+                       max_pairwise_memory_mb=DEFAULT_MAX_PAIRWISE_MEMORY_MB):
     """
     Internal function to apply UMAP and HDBSCAN clustering.
     Handles cosine metric special case.
@@ -139,35 +183,42 @@ def _apply_umap_hdbscan(X, umap_params, hdbscan_params, random_state=None):
         umap_params: UMAP parameters
         hdbscan_params: HDBSCAN parameters
         random_state: Random state for reproducibility
+        max_pairwise_memory_mb: Maximum cosine distance-matrix size in MiB.
         
     Returns:
-        tuple: (umap_embeddings, cluster_labels, hdbscan_model)
+        tuple: (umap_embeddings, cluster_labels, hdbscan_model, umap_model)
     """
+    if hdbscan_params.get('metric', 'euclidean') == 'cosine':
+        _check_pairwise_memory(X.shape[0], max_pairwise_memory_mb)
+
     # Add random_state to UMAP params if not already present
     umap_params_copy = umap_params.copy()
     if 'random_state' not in umap_params_copy:
-        umap_params_copy['random_state'] = random_state or 42
+        umap_params_copy['random_state'] = random_state if random_state is not None else 42
     
     # Apply UMAP dimensionality reduction
+    global UMAP
+    if UMAP is None:
+        from umap import UMAP as _UMAP
+        UMAP = _UMAP
     umap_model = UMAP(**umap_params_copy)
     umap_emb = umap_model.fit_transform(X)
     
     # Handle cosine metric for HDBSCAN on UMAP embeddings
-    if hdbscan_params['metric'] == 'cosine':
+    if hdbscan_params.get('metric', 'euclidean') == 'cosine':
         # Compute pairwise cosine distances on UMAP embeddings
-        distance_matrix = pairwise_distances(umap_emb, metric='cosine')
-        hdbscan_model = hdbscan.HDBSCAN(
-            min_cluster_size=hdbscan_params['min_cluster_size'],
-            cluster_selection_method=hdbscan_params['cluster_selection_method'],
-            metric='precomputed'
+        distance_matrix = pairwise_distances(
+            np.asarray(umap_emb, dtype=np.float64), metric='cosine'
         )
-        clusters = hdbscan_model.fit(distance_matrix.astype('float64'))
+        precomputed_params = dict(hdbscan_params, metric='precomputed')
+        hdbscan_model = hdbscan.HDBSCAN(**precomputed_params)
+        clusters = hdbscan_model.fit(distance_matrix)
     else:
         # Apply HDBSCAN directly on UMAP embeddings
         hdbscan_model = hdbscan.HDBSCAN(**hdbscan_params)
         clusters = hdbscan_model.fit(umap_emb)
     
-    return umap_emb, clusters.labels_, hdbscan_model
+    return umap_emb, clusters.labels_, hdbscan_model, umap_model
 
 
 def tune_clustering_hyperparameters(
@@ -182,7 +233,9 @@ def tune_clustering_hyperparameters(
     max_iterations=100,
     target_metric='davies_bouldin',
     progress=False,
-    random_state=42
+    random_state=42,
+    max_pairwise_memory_mb=DEFAULT_MAX_PAIRWISE_MEMORY_MB,
+    min_coverage=0.5
 ):
     """
     Tune hyperparameters for UMAP+HDBSCAN clustering pipeline.
@@ -200,11 +253,9 @@ def tune_clustering_hyperparameters(
                                          Keys should be valid UMAP parameters.
         hdbscan_param_grid (dict, optional): Parameter grid for HDBSCAN. If None, uses DEFAULT_HDBSCAN_GRID.
                                             Keys should be valid HDBSCAN parameters.
-        tsne_params (dict, optional): Fixed t-SNE parameters to use. If None and tune_tsne=False,
-                                     uses DEFAULT_TSNE_PARAMS. Ignored if tune_tsne=True.
-        tune_tsne (bool): Whether to tune t-SNE parameters. If False, uses fixed tsne_params.
-        tsne_param_grid (dict, optional): Parameter grid for t-SNE tuning. Only used if tune_tsne=True.
-                                         If None, uses DEFAULT_TSNE_GRID.
+        tsne_params (dict, optional): Fixed t-SNE parameters to store for final visualization.
+        tune_tsne (bool): Unsupported; t-SNE does not affect clustering quality evaluation.
+        tsne_param_grid (dict, optional): Unsupported; t-SNE is not part of clustering search.
         min_clusters (int): Minimum number of clusters required (excluding noise) for a 
                            configuration to be considered valid.
         time_limit (int): Maximum tuning time in seconds. Tuning stops after this time.
@@ -213,12 +264,18 @@ def tune_clustering_hyperparameters(
                             'calinski_harabasz' (maximize).
         progress (bool): Whether to print progress updates every 10 iterations.
         random_state (int): Random state for reproducibility.
+        max_pairwise_memory_mb (float): Maximum cosine distance matrix in MiB.
+                                       Oversized trials are recorded as failures.
+        min_coverage (float): Minimum fraction of documents that must be assigned to
+                              clusters for a candidate to be eligible (0 to 1).
         
     Returns:
         dict: Dictionary containing:
             - 'best_params' (dict or None): Best parameters found with keys 'umap', 'hdbscan', 'tsne'.
                                            None if no valid configuration found.
             - 'best_score' (float): Best score achieved for the target metric.
+            - 'best_metrics' (dict or None): Metrics for the selected candidate,
+                                            including assigned-document coverage.
             - 'history' (list): List of dicts, each containing iteration results with keys:
                 - 'iteration': iteration number
                 - 'params': parameters tried
@@ -230,25 +287,14 @@ def tune_clustering_hyperparameters(
     Raises:
         ValueError: If X is empty, target_metric is invalid, or parameters are malformed.
     """
-    # Set random seeds for reproducibility
-    np.random.seed(random_state)
-    random.seed(random_state)
-    
-    # Validate input - handle sparse matrices properly
-    if X is None:
-        raise ValueError("Input data X cannot be None")
-    
-    try:
-        from scipy.sparse import issparse
-        if issparse(X):
-            if X.shape[0] == 0:
-                raise ValueError("Input data X cannot be empty")
-        else:
-            if len(X) == 0:
-                raise ValueError("Input data X cannot be empty")
-    except ImportError:
-        if len(X) == 0:
-            raise ValueError("Input data X cannot be empty")
+    X = _validate_clustering_input(X)
+
+    if tune_tsne:
+        raise ValueError("tune_tsne is unsupported: clustering search evaluates UMAP/HDBSCAN only. Tune t-SNE separately for visualization.")
+    if tsne_param_grid is not None:
+        raise ValueError("tsne_param_grid is unsupported because t-SNE is not evaluated during clustering search.")
+    if not np.isfinite(min_coverage) or not 0 <= min_coverage <= 1:
+        raise ValueError("min_coverage must be a finite value between 0 and 1")
     
     if target_metric not in ['davies_bouldin', 'calinski_harabasz']:
         raise ValueError("target_metric must be either 'davies_bouldin' or 'calinski_harabasz'")
@@ -258,13 +304,11 @@ def tune_clustering_hyperparameters(
     hdbscan_param_grid = hdbscan_param_grid or DEFAULT_HDBSCAN_GRID.copy()
     
     # Handle t-SNE parameters
-    if tune_tsne:
-        tsne_param_grid = tsne_param_grid or DEFAULT_TSNE_GRID.copy()
-    else:
-        tsne_params = tsne_params or DEFAULT_TSNE_PARAMS.copy()
+    tsne_params = tsne_params or DEFAULT_TSNE_PARAMS.copy()
     
     best_score = float('inf') if target_metric == 'davies_bouldin' else float('-inf')
     best_params = None
+    best_metrics = None
     history = []
     start_time = time.time()
     
@@ -276,25 +320,28 @@ def tune_clustering_hyperparameters(
         
         try:
             # Randomly sample parameters
-            umap_params = random_parameter_combination(umap_param_grid, random_state=random_state + iteration)
-            hdbscan_params = random_parameter_combination(hdbscan_param_grid, random_state=random_state + iteration)
+            umap_params = random_parameter_combination(umap_param_grid, random_state=random_state + iteration * 2)
+            hdbscan_params = random_parameter_combination(hdbscan_param_grid, random_state=random_state + iteration * 2 + 1)
+            # Save the actual trial seed so applying the winner reproduces its fit.
+            umap_params.setdefault('random_state', random_state + iteration)
             
             # Handle t-SNE parameters
-            if tune_tsne:
-                current_tsne_params = random_parameter_combination(tsne_param_grid, random_state=random_state + iteration)
-                current_tsne_params['random_state'] = random_state + iteration
-            else:
-                current_tsne_params = tsne_params.copy()
+            current_tsne_params = tsne_params.copy()
             
             # Apply UMAP and HDBSCAN
-            umap_emb, cluster_labels, _ = _apply_umap_hdbscan(X, umap_params, hdbscan_params, random_state=random_state + iteration)
+            umap_emb, cluster_labels, _, _ = _apply_umap_hdbscan(
+                X, umap_params, hdbscan_params, random_state=random_state + iteration,
+                max_pairwise_memory_mb=max_pairwise_memory_mb
+            )
             
             # Evaluate clustering quality on UMAP embeddings (not t-SNE)
             metrics = evaluate_clustering_quality(cluster_labels, umap_emb)
             
             # Determine if this is the best result so far
             current_score = metrics[target_metric]
-            valid_clusters = metrics['n_clusters'] >= min_clusters
+            valid_clusters = (metrics['n_clusters'] >= min_clusters and
+                              metrics['coverage'] >= min_coverage and
+                              np.isfinite(current_score))
             
             if valid_clusters:
                 is_better = (
@@ -304,6 +351,7 @@ def tune_clustering_hyperparameters(
                 
                 if is_better:
                     best_score = current_score
+                    best_metrics = metrics.copy()
                     best_params = {
                         'umap': umap_params,
                         'hdbscan': hdbscan_params,
@@ -311,7 +359,7 @@ def tune_clustering_hyperparameters(
                     }
                     if progress:
                         print(f"New best at iteration {iteration}: {target_metric} = {best_score:.4f}, "
-                              f"n_clusters = {metrics['n_clusters']}")
+                              f"n_clusters = {metrics['n_clusters']}, coverage = {metrics['coverage']:.1%}")
             
             # Store history
             history.append({
@@ -352,13 +400,15 @@ def tune_clustering_hyperparameters(
     return {
         'best_params': best_params,
         'best_score': best_score,
+        'best_metrics': best_metrics,
         'history': history,
         'total_time': total_time,
         'iterations_completed': len(history)
     }
 
 
-def apply_best_clustering(X, best_params, compute_tsne=True, random_state=42):
+def apply_best_clustering(X, best_params, compute_tsne=False, random_state=42,
+                          max_pairwise_memory_mb=DEFAULT_MAX_PAIRWISE_MEMORY_MB):
     """
     Apply the best found clustering parameters to the data.
     
@@ -374,6 +424,8 @@ def apply_best_clustering(X, best_params, compute_tsne=True, random_state=42):
         compute_tsne (bool): Whether to compute t-SNE embeddings for visualization. 
                             Set to False to skip t-SNE and improve performance.
         random_state (int): Random state for reproducibility.
+        max_pairwise_memory_mb (float): Maximum cosine distance matrix in MiB;
+                                       excludes additional algorithm workspace.
         
     Returns:
         dict: Dictionary containing:
@@ -387,9 +439,9 @@ def apply_best_clustering(X, best_params, compute_tsne=True, random_state=42):
     Raises:
         ValueError: If X is empty or best_params is None/malformed.
         KeyError: If best_params is missing required keys.
+        MemoryError: If an explicit cosine distance matrix exceeds the size limit.
     """
-    if X is None or len(X) == 0:
-        raise ValueError("Input data X cannot be None or empty")
+    X = _validate_clustering_input(X)
     
     if best_params is None:
         raise ValueError("best_params cannot be None")
@@ -410,11 +462,10 @@ def apply_best_clustering(X, best_params, compute_tsne=True, random_state=42):
         
         # Use _apply_umap_hdbscan as the single source of truth for both
         # embeddings and cluster labels, avoiding a second independent UMAP fit
-        umap_emb, cluster_labels, hdbscan_model = _apply_umap_hdbscan(X, umap_params, hdbscan_params, random_state=random_state)
-        
-        # Reconstruct the fitted UMAP model for storage in results
-        umap_model = UMAP(**umap_params)
-        umap_model.fit(X)
+        umap_emb, cluster_labels, hdbscan_model, umap_model = _apply_umap_hdbscan(
+            X, umap_params, hdbscan_params, random_state=random_state,
+            max_pairwise_memory_mb=max_pairwise_memory_mb
+        )
         
         # Apply t-SNE on UMAP embeddings for visualization (optional)
         tsne_emb = None
@@ -442,6 +493,8 @@ def apply_best_clustering(X, best_params, compute_tsne=True, random_state=42):
             'umap_model': umap_model
         }
     
+    except MemoryError:
+        raise
     except Exception as e:
         raise RuntimeError(f"Failed to apply clustering with best parameters: {e}")
 
@@ -456,8 +509,13 @@ def full_clustering_pipeline(
     progress=True,
     tsne_params=None,
     tune_tsne=False,
-    compute_tsne=True,
-    random_state=42
+    compute_tsne=False,
+    random_state=42,
+    umap_param_grid=None,
+    hdbscan_param_grid=None,
+    tsne_param_grid=None,
+    max_pairwise_memory_mb=DEFAULT_MAX_PAIRWISE_MEMORY_MB,
+    min_coverage=0.5
 ):
     """
     Complete clustering pipeline from raw data to final clusters.
@@ -471,9 +529,9 @@ def full_clustering_pipeline(
     t-SNE can optionally be used for 2D visualization.
     
     Args:
-        X (np.ndarray): Input data matrix of shape (n_samples, n_features).
-        standardize (bool): Whether to standardize the data (zero mean, unit variance) 
-                           before clustering. Recommended for features on different scales.
+        X (array or sparse matrix): Features of shape (n_samples, n_features).
+        standardize (bool): Scale to unit variance. Dense input is also centered;
+                           sparse input is never centered, preserving sparsity.
         min_clusters (int): Minimum number of clusters required (excluding noise) for a 
                            configuration to be considered valid during tuning.
         time_limit (int): Maximum tuning time in seconds.
@@ -481,12 +539,18 @@ def full_clustering_pipeline(
         target_metric (str): Metric to optimize. Either 'davies_bouldin' (minimize) or 
                             'calinski_harabasz' (maximize).
         progress (bool): Whether to print progress updates during tuning.
-        tsne_params (dict, optional): Fixed t-SNE parameters. If None and tune_tsne=False,
-                                     uses DEFAULT_TSNE_PARAMS.
-        tune_tsne (bool): Whether to tune t-SNE parameters during hyperparameter search.
+        tsne_params (dict, optional): Fixed t-SNE parameters. Defaults to DEFAULT_TSNE_PARAMS.
+        tune_tsne (bool): Unsupported; raises ValueError because t-SNE is not scored.
         compute_tsne (bool): Whether to compute final t-SNE embeddings. Set to False to 
                             skip t-SNE and improve performance.
         random_state (int): Random state for reproducibility.
+        umap_param_grid (dict, optional): Override the UMAP search grid.
+        hdbscan_param_grid (dict, optional): Override the HDBSCAN search grid.
+        tsne_param_grid (dict, optional): Unsupported; raises ValueError because t-SNE is not scored.
+        min_coverage (float): Minimum fraction of documents that must be assigned
+                              for a clustering candidate to be eligible.
+        max_pairwise_memory_mb (float): Maximum cosine distance matrix in MiB;
+                                       excludes additional algorithm workspace.
         
     Returns:
         dict: Dictionary containing:
@@ -495,7 +559,7 @@ def full_clustering_pipeline(
             - 'clustering_results' (dict or None): Final clustering results including 
                                                   embeddings and cluster labels. 
                                                   None if no valid parameters found.
-            - 'preprocessed_data' (np.ndarray): The preprocessed input data (standardized if requested).
+            - 'preprocessed_data' (array or sparse matrix): Features, sparse if input is sparse.
             - 'scaler' (StandardScaler or None): The fitted scaler if standardization was applied.
             - 'success' (bool): Whether clustering was successful.
             - 'error_message' (str or None): Error message if clustering failed.
@@ -503,27 +567,14 @@ def full_clustering_pipeline(
     Raises:
         ValueError: If X is empty or invalid.
     """
-    # Set random seeds for reproducibility
-    np.random.seed(random_state)
-    random.seed(random_state)
-    
-    # Validate input - handle sparse matrices properly
-    if X is None:
-        raise ValueError("Input data X cannot be None")
-    
-    try:
-        from scipy.sparse import issparse
-        if issparse(X):
-            if X.shape[0] == 0:
-                raise ValueError("Input data X cannot be empty")
-            # Convert sparse to dense
-            X = X.toarray()
-        else:
-            if len(X) == 0:
-                raise ValueError("Input data X cannot be empty")
-    except ImportError:
-        if len(X) == 0:
-            raise ValueError("Input data X cannot be empty")
+    X = _validate_clustering_input(X)
+
+    if tune_tsne:
+        raise ValueError("tune_tsne is unsupported: clustering search evaluates UMAP/HDBSCAN only. Tune t-SNE separately for visualization.")
+    if tsne_param_grid is not None:
+        raise ValueError("tsne_param_grid is unsupported because t-SNE is not evaluated during clustering search.")
+    if not np.isfinite(min_coverage) or not 0 <= min_coverage <= 1:
+        raise ValueError("min_coverage must be a finite value between 0 and 1")
     
     result = {
         'tuning_results': None,
@@ -535,15 +586,9 @@ def full_clustering_pipeline(
     }
     
     try:
-        # Standardize data if requested
-        X_processed = X.copy()
-        scaler = None
-        
-        if standardize:
-            scaler = StandardScaler()
-            X_processed = scaler.fit_transform(X_processed)
-            if progress:
-                print("Data standardized")
+        X_processed, scaler = _prepare_clustering_input(X, standardize)
+        if standardize and progress:
+            print("Data standardized (sparse input is not centered)")
         
         result['preprocessed_data'] = X_processed
         result['scaler'] = scaler
@@ -561,7 +606,12 @@ def full_clustering_pipeline(
             progress=progress,
             tsne_params=tsne_params,
             tune_tsne=tune_tsne,
-            random_state=random_state
+            random_state=random_state,
+            umap_param_grid=umap_param_grid,
+            hdbscan_param_grid=hdbscan_param_grid,
+            tsne_param_grid=tsne_param_grid,
+            max_pairwise_memory_mb=max_pairwise_memory_mb,
+            min_coverage=min_coverage
         )
         
         result['tuning_results'] = tuning_results
@@ -575,7 +625,8 @@ def full_clustering_pipeline(
                 X_processed, 
                 tuning_results['best_params'],
                 compute_tsne=compute_tsne,
-                random_state=random_state
+                random_state=random_state,
+                max_pairwise_memory_mb=max_pairwise_memory_mb
             )
             
             result['clustering_results'] = clustering_results
@@ -609,8 +660,9 @@ def full_clustering_pipeline_fixed_params(
     tsne_params=None,
     standardize=True,
     progress=False,
-    compute_tsne=True,
-    random_state=42
+    compute_tsne=False,
+    random_state=42,
+    max_pairwise_memory_mb=DEFAULT_MAX_PAIRWISE_MEMORY_MB
 ):
     """
     Complete clustering pipeline with fixed parameters (no tuning).
@@ -620,19 +672,22 @@ def full_clustering_pipeline_fixed_params(
     or for quick testing.
     
     Args:
-        X (np.ndarray): Input data matrix of shape (n_samples, n_features).
+        X (array or sparse matrix): Features of shape (n_samples, n_features).
         umap_params (dict, optional): UMAP parameters. If None, uses sensible defaults.
         hdbscan_params (dict, optional): HDBSCAN parameters. If None, uses sensible defaults.
         tsne_params (dict, optional): t-SNE parameters. If None, uses DEFAULT_TSNE_PARAMS.
-        standardize (bool): Whether to standardize the data before clustering.
+        standardize (bool): Scale to unit variance. Dense input is also centered;
+                            sparse input is never centered, preserving sparsity.
         progress (bool): Whether to print progress messages.
         compute_tsne (bool): Whether to compute t-SNE embeddings for visualization.
         random_state (int): Random state for reproducibility.
+        max_pairwise_memory_mb (float): Maximum cosine distance matrix in MiB;
+                                       excludes additional algorithm workspace.
         
     Returns:
         dict: Dictionary containing:
             - 'clustering_results' (dict): Clustering results including embeddings and labels.
-            - 'preprocessed_data' (np.ndarray): The preprocessed input data.
+            - 'preprocessed_data' (array or sparse matrix): Features, sparse if input is sparse.
             - 'scaler' (StandardScaler or None): The fitted scaler if standardization was applied.
             - 'success' (bool): Whether clustering was successful.
             - 'error_message' (str or None): Error message if clustering failed.
@@ -641,27 +696,7 @@ def full_clustering_pipeline_fixed_params(
     Raises:
         ValueError: If X is empty or invalid.
     """
-    # Set random seeds for reproducibility
-    np.random.seed(random_state)
-    random.seed(random_state)
-    
-    # Validate input - handle sparse matrices properly
-    if X is None:
-        raise ValueError("Input data X cannot be None")
-    
-    # Check if sparse matrix
-    try:
-        from scipy.sparse import issparse
-        if issparse(X):
-            if X.shape[0] == 0:
-                raise ValueError("Input data X cannot be empty")
-        else:
-            if len(X) == 0:
-                raise ValueError("Input data X cannot be empty")
-    except ImportError:
-        # If scipy not available, assume dense array
-        if len(X) == 0:
-            raise ValueError("Input data X cannot be empty")
+    X = _validate_clustering_input(X)
     
     # Set default parameters if not provided
     if umap_params is None:
@@ -698,23 +733,9 @@ def full_clustering_pipeline_fixed_params(
     }
     
     try:
-        # Convert sparse to dense if needed and copy
-        try:
-            from scipy.sparse import issparse
-            if issparse(X):
-                X_processed = X.toarray()
-            else:
-                X_processed = np.array(X) if not isinstance(X, np.ndarray) else X.copy()
-        except ImportError:
-            X_processed = np.array(X) if not isinstance(X, np.ndarray) else X.copy()
-        
-        scaler = None
-        
-        if standardize:
-            scaler = StandardScaler()
-            X_processed = scaler.fit_transform(X_processed)
-            if progress:
-                print("Data standardized")
+        X_processed, scaler = _prepare_clustering_input(X, standardize)
+        if standardize and progress:
+            print("Data standardized (sparse input is not centered)")
         
         result['preprocessed_data'] = X_processed
         result['scaler'] = scaler
@@ -733,7 +754,8 @@ def full_clustering_pipeline_fixed_params(
             X_processed,
             best_params,
             compute_tsne=compute_tsne,
-            random_state=random_state
+            random_state=random_state,
+            max_pairwise_memory_mb=max_pairwise_memory_mb
         )
         
         result['clustering_results'] = clustering_results

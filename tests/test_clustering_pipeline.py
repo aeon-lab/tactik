@@ -380,6 +380,41 @@ class TestPreprocessing(BaseTestCase):
         # define_stopwords should be called once
         self.assertEqual(mock_define.call_count, 1)
 
+    @patch('clustering_pipeline.pre_processing_routine')
+    @patch('clustering_pipeline.define_stopwords', return_value=['fresh'])
+    @patch('clustering_pipeline.remove_stopwords_corpus', return_value=np.array(['new clean'] * 15))
+    def test_reprocessing_clears_stale_analysis_and_generated_columns(
+            self, mock_remove, mock_define, mock_preprocess):
+        mock_preprocess.return_value = (
+            pd.Series(['new processed'] * 15),
+            pd.Series(['new numbered'] * 15)
+        )
+        pipeline = ClusteringPipeline(self.sample_dataframe)
+        pipeline._vectorized_text = np.ones((15, 3))
+        pipeline._stopwords = ['stale']
+        pipeline._stopwords_params_key = ('old',)
+        pipeline.clustering_results = {'old': True}
+        pipeline.keywords = pd.DataFrame({'old': [1]})
+        pipeline.topics = {'old': True}
+        pipeline.df['Clusters'] = [0] * 15
+        pipeline.df['Narratives'] = ['stale text'] * 15
+        pipeline.df['Processed_Narrative'] = [['stale']] * 15
+        pipeline._generated_columns.update(
+            {'Clusters', 'Narratives', 'Processed_Narrative'})
+
+        pipeline.preprocess_data()
+
+        self.assertIsNone(pipeline._vectorized_text)
+        self.assertIsNone(pipeline.clustering_results)
+        self.assertIsNone(pipeline.keywords)
+        self.assertIsNone(pipeline.topics)
+        self.assertEqual(pipeline._stopwords, ['fresh'])
+        self.assertNotIn('Clusters', pipeline.df.columns)
+        self.assertNotIn('Narratives', pipeline.df.columns)
+        self.assertNotIn('Processed_Narrative', pipeline.df.columns)
+        self.assertEqual(pipeline.df['processed_stopword_Narr'].iloc[0], 'new clean')
+        mock_define.assert_called_once()
+
 
 # ============================================================================
 # Clustering Tests
@@ -387,6 +422,27 @@ class TestPreprocessing(BaseTestCase):
 
 class TestClustering(BaseTestCase):
     """Test clustering functionality."""
+
+    @patch('clustering_pipeline.full_clustering_pipeline_fixed_params',
+           side_effect=RuntimeError('fit failed'))
+    def test_failed_reclustering_clears_previous_analysis_state(self, mock_pipeline):
+        pipeline = ClusteringPipeline(self.sample_dataframe)
+        pipeline._ensure_df_copy()
+        pipeline.df['processed_stopword_Narr'] = ['text'] * len(pipeline.df)
+        pipeline.df['Clusters'] = [0] * len(pipeline.df)
+        pipeline._generated_columns.add('Clusters')
+        pipeline._vectorized_text = self.mock_vectorized_data
+        pipeline.clustering_results = {'old': True}
+        pipeline.keywords = {'old': True}
+        pipeline.topics = {'old': True}
+
+        with self.assertRaisesRegex(RuntimeError, 'fit failed'):
+            pipeline.cluster_data()
+
+        self.assertNotIn('Clusters', pipeline.df.columns)
+        self.assertIsNone(pipeline.clustering_results)
+        self.assertIsNone(pipeline.keywords)
+        self.assertIsNone(pipeline.topics)
     
     @patch('clustering_pipeline.vectorize_text')
     @patch('clustering_pipeline.full_clustering_pipeline_fixed_params')
@@ -690,6 +746,25 @@ class TestTopicAnalysis(BaseTestCase):
         self.assertIn('Processed_Narrative', pipeline.df.columns)
         self.assertIsInstance(pipeline.df['Processed_Narrative'].iloc[0], list)
         self.assertEqual(pipeline.df['Processed_Narrative'].iloc[0], ['word1', 'word2', 'word3'])
+
+    @patch('clustering_pipeline.TopicModeler')
+    def test_analyze_topics_excludes_hdbscan_noise(self, mock_modeler_class):
+        mock_modeler = Mock()
+        mock_modeler.get_cluster_topics.return_value = {}
+        mock_modeler.match_designators_to_topics.return_value = {}
+        mock_modeler_class.return_value = mock_modeler
+
+        pipeline = ClusteringPipeline(self.sample_dataframe)
+        pipeline._ensure_df_copy()
+        pipeline.df['Clusters'] = [0, -1] * 7 + [1]
+        pipeline.df['processed_stopword_Narr'] = [f'row {i}' for i in range(15)]
+
+        pipeline.analyze_topics()
+
+        passed_texts = mock_modeler_class.call_args.kwargs['texts']
+        passed_clusters = mock_modeler_class.call_args.kwargs['clusters']
+        self.assertEqual(len(passed_texts), 8)
+        self.assertNotIn(-1, passed_clusters)
     
     def test_analyze_topics_without_clustering_raises_error(self):
         """Test topic analysis without clustering raises error."""
@@ -871,7 +946,7 @@ class TestFullPipeline(BaseTestCase):
         
         pipeline = ClusteringPipeline(self.sample_dataframe)
         
-        # Should not raise, but print warning
+        # Independent stages finish, but the returned result exposes the error.
         results = pipeline.full_pipeline(
             tune_hyperparameters=False,
             visualize=True,
@@ -881,6 +956,7 @@ class TestFullPipeline(BaseTestCase):
         
         # Pipeline should still succeed
         self.assertIn('clustering', results)
+        self.assertIn('Plot error', results['errors']['visualization'])
     
     @patch('clustering_pipeline.full_clustering_pipeline_fixed_params')
     @patch('clustering_pipeline.vectorize_text')
@@ -912,6 +988,27 @@ class TestFullPipeline(BaseTestCase):
         self.assertIn('clustering', results)
         self.assertIsNone(results['keywords'])
         self.assertIsNone(results['topics'])
+
+    def test_tsne_options_reach_cluster_data(self):
+        pipeline = ClusteringPipeline(self.sample_dataframe)
+        pipeline.preprocess_data = Mock()
+        pipeline.cluster_data = Mock(return_value={'success': True})
+
+        pipeline.full_pipeline(
+            visualize=False,
+            extract_keywords=False,
+            analyze_topics=False,
+            compute_tsne=False,
+            tsne_perplexity=7,
+            tsne_early_exaggeration=9,
+            tsne_learning_rate=123
+        )
+
+        kwargs = pipeline.cluster_data.call_args.kwargs
+        self.assertFalse(kwargs['compute_tsne'])
+        self.assertEqual(kwargs['tsne_perplexity'], 7)
+        self.assertEqual(kwargs['tsne_early_exaggeration'], 9)
+        self.assertEqual(kwargs['tsne_learning_rate'], 123)
 
 
 # ============================================================================
@@ -1214,7 +1311,7 @@ class TestParameterPassing(BaseTestCase):
             max_iterations=100,
             target_metric='calinski_harabasz',
             standardize=False,
-            tune_tsne=True
+            tune_tsne=False
         )
         
         call_kwargs = mock_pipeline.call_args[1]
@@ -1223,7 +1320,15 @@ class TestParameterPassing(BaseTestCase):
         self.assertEqual(call_kwargs['max_iterations'], 100)
         self.assertEqual(call_kwargs['target_metric'], 'calinski_harabasz')
         self.assertFalse(call_kwargs['standardize'])
-        self.assertTrue(call_kwargs['tune_tsne'])
+        self.assertFalse(call_kwargs['tune_tsne'])
+        self.assertEqual(call_kwargs['min_coverage'], 0.5)
+
+    @patch('clustering_pipeline.full_clustering_pipeline')
+    def test_tune_and_cluster_rejects_unevaluated_tsne_search(self, mock_pipeline):
+        pipeline = ClusteringPipeline(self.sample_dataframe)
+        with self.assertRaisesRegex(ValueError, "tune_tsne is unsupported"):
+            pipeline.tune_and_cluster(tune_tsne=True)
+        mock_pipeline.assert_not_called()
 
 
 # ============================================================================
@@ -1277,6 +1382,98 @@ class TestProgressReporting(BaseTestCase):
 # ============================================================================
 # Main Test Runner
 # ============================================================================
+
+class TestSparseOptions(BaseTestCase):
+    def _pipeline(self):
+        pipeline = ClusteringPipeline(self.sample_dataframe)
+        pipeline._ensure_df_copy()
+        pipeline.df['processed_stopword_Narr'] = ['text'] * len(pipeline.df)
+        return pipeline
+
+    def test_fixed_and_tuned_defaults_separate_metrics_and_skip_extra_work(self):
+        for tune, function in [(False, 'full_clustering_pipeline_fixed_params'),
+                               (True, 'full_clustering_pipeline')]:
+            with self.subTest(tune=tune), \
+                    patch('clustering_pipeline.vectorize_text', return_value=self.mock_vectorized_data), \
+                    patch('clustering_pipeline.' + function, return_value=self.mock_clustering_results) as run:
+                pipeline = self._pipeline()
+                (pipeline.tune_and_cluster if tune else pipeline.cluster_data)()
+                options = run.call_args.kwargs
+                self.assertFalse(options['standardize'])
+                self.assertFalse(options['compute_tsne'])
+                if tune:
+                    self.assertEqual(options['umap_param_grid']['metric'], ['cosine'])
+                    self.assertEqual(options['hdbscan_param_grid']['metric'], ['euclidean'])
+                else:
+                    self.assertEqual(options['umap_params']['metric'], 'cosine')
+                    self.assertEqual(options['hdbscan_params']['metric'], 'euclidean')
+
+    def test_legacy_alias_does_not_change_hdbscan_metric(self):
+        with patch('clustering_pipeline.vectorize_text', return_value=self.mock_vectorized_data), \
+                patch('clustering_pipeline.full_clustering_pipeline_fixed_params',
+                      return_value=self.mock_clustering_results) as run:
+            self._pipeline().cluster_data(metric='manhattan')
+        self.assertEqual(run.call_args.kwargs['umap_params']['metric'], 'manhattan')
+        self.assertEqual(run.call_args.kwargs['hdbscan_params']['metric'], 'euclidean')
+
+    def test_conflicting_aliases_are_rejected(self):
+        for method in ('cluster_data', 'tune_and_cluster'):
+            with self.subTest(method=method), self.assertRaisesRegex(ValueError, 'must agree'):
+                getattr(self._pipeline(), method)(metric='cosine', umap_metric='euclidean')
+
+    def test_full_pipeline_forwards_options_on_both_paths(self):
+        for tune, function in [(False, 'full_clustering_pipeline_fixed_params'),
+                               (True, 'full_clustering_pipeline')]:
+            for visualize, compute in [(False, None), (True, None), (True, False), (False, True)]:
+                with self.subTest(tune=tune, visualize=visualize, compute=compute), \
+                        patch('clustering_pipeline.vectorize_text', return_value=self.mock_vectorized_data), \
+                        patch('clustering_pipeline.' + function,
+                              return_value=self.mock_clustering_results) as run:
+                    pipeline = self._pipeline()
+                    pipeline.preprocess_data = Mock()
+                    pipeline.visualize_clusters = Mock()
+                    options = {} if compute is None else {'compute_tsne': compute}
+                    pipeline.full_pipeline(
+                        tune_hyperparameters=tune, visualize=visualize,
+                        extract_keywords=False, analyze_topics=False,
+                        umap_metric='manhattan', hdbscan_metric='cosine',
+                        standardize=True, tsne_perplexity=5, tsne_early_exaggeration=10,
+                        tsne_learning_rate=150, max_pairwise_memory_mb=12,
+                        max_iterations=7, **options)
+                    expected_compute = visualize if compute is None else compute
+                    passed = run.call_args.kwargs
+                    self.assertEqual(passed['compute_tsne'], expected_compute)
+                    self.assertTrue(passed['standardize'])
+                    self.assertEqual(passed['max_pairwise_memory_mb'], 12)
+                    self.assertEqual(passed['tsne_params']['perplexity'], 5)
+                    self.assertEqual(passed['tsne_params']['early_exaggeration'], 10)
+                    self.assertEqual(passed['tsne_params']['learning_rate'], 150)
+                    if tune:
+                        self.assertEqual(passed['max_iterations'], 7)
+                        self.assertEqual(passed['umap_param_grid']['metric'], ['manhattan'])
+                        self.assertEqual(passed['hdbscan_param_grid']['metric'], ['cosine'])
+                    else:
+                        self.assertEqual(passed['umap_params']['metric'], 'manhattan')
+                        self.assertEqual(passed['hdbscan_params']['metric'], 'cosine')
+                    self.assertEqual(pipeline.visualize_clusters.called, visualize and expected_compute)
+
+    def test_combined_analysis_methods_forward_separate_metrics(self):
+        for method in ('cluster_and_extract_keywords', 'cluster_and_analyze_topics'):
+            with self.subTest(method=method), \
+                    patch('clustering_pipeline.vectorize_text', return_value=self.mock_vectorized_data), \
+                    patch('clustering_pipeline.full_clustering_pipeline_fixed_params',
+                          return_value=self.mock_clustering_results) as run:
+                pipeline = self._pipeline()
+                pipeline.extract_keywords = Mock()
+                pipeline.analyze_topics = Mock()
+                getattr(pipeline, method)(umap_metric='manhattan', hdbscan_metric='cosine',
+                                          compute_tsne=False, max_pairwise_memory_mb=10)
+                passed = run.call_args.kwargs
+                self.assertEqual(passed['umap_params']['metric'], 'manhattan')
+                self.assertEqual(passed['hdbscan_params']['metric'], 'cosine')
+                self.assertEqual(passed['max_pairwise_memory_mb'], 10)
+                self.assertFalse(passed['compute_tsne'])
+
 
 if __name__ == '__main__':
     # Run with verbose output

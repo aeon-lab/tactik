@@ -13,21 +13,36 @@ Classes:
 
 import pandas as pd
 from collections import defaultdict
+# Gensim versions allowed by the project still reference scipy.linalg.triu;
+# SciPy 1.13 removed that alias, while NumPy provides equivalent semantics.
+import numpy as np
+import scipy.linalg
+if not hasattr(scipy.linalg, "triu"):
+    scipy.linalg.triu = np.triu
 import gensim
 from gensim import corpora
 from gensim.models import LdaModel
-from nltk.tokenize import word_tokenize
-import nltk
-from transformers import BertTokenizer, BertModel
 import torch
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Dict, Tuple, Optional
-import numpy as np
 import logging
+
+# Populated on demand by load_bert; placeholders preserve a small, mockable
+# surface for applications that test or replace the transformer backend.
+BertTokenizer = None
+BertModel = None
+
+try:
+    from .nltk_resources import ensure_punkt_data, word_tokenize
+except ImportError:
+    from nltk_resources import ensure_punkt_data, word_tokenize
 
 
 try:
     from .utilities import (
+        calculate_tf,
+        calculate_mean_tf,
+        calculate_idf,
         calculate_tf_corpus,
         calculate_tfidf_corpus,
         calculate_tfdf_corpus,
@@ -35,6 +50,9 @@ try:
     )
 except ImportError:
     from utilities import (
+        calculate_tf,
+        calculate_mean_tf,
+        calculate_idf,
         calculate_tf_corpus,
         calculate_tfidf_corpus,
         calculate_tfdf_corpus,
@@ -44,13 +62,6 @@ except ImportError:
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Ensure NLTK data is downloaded
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt', quiet=True)
-
 
 class KeywordExtractor:
     """
@@ -154,15 +165,29 @@ class KeywordExtractor:
         
         for cluster in unique_clusters:
             cluster_filter = (self.frame[self.cluster_col] == cluster)
-            cluster_frame = self.frame.loc[cluster_filter].copy()
+            # Limit the temporary frame to fields used here; wide input frames
+            # can otherwise make every cluster iteration copy many unrelated columns.
+            cluster_frame = self.frame.loc[
+                cluster_filter, [self.narrative_col, self.narrative_long_col]
+            ]
             
             short_texts = cluster_frame[self.narrative_col]
             long_texts = cluster_frame[self.narrative_long_col]
             
-            # Extract keywords using different methods
-            tf_keywords = calculate_tf_corpus(short_texts, tf_top_n)
-            tfidf_keywords = calculate_tfidf_corpus(short_texts, tf_top_n)
-            tfdf_keywords = calculate_tfdf_corpus(short_texts, tf_top_n)
+            # Share the expensive token-frequency passes across TF, TF-IDF,
+            # and TF-DF rather than rebuilding them independently.
+            tf_documents = calculate_tf(short_texts)
+            mean_tf = calculate_mean_tf(tf_documents)
+            idf_scores = calculate_idf(short_texts)
+            tf_keywords = calculate_tf_corpus(
+                short_texts, tf_top_n, tf_documents=tf_documents, mean_tf=mean_tf
+            )
+            tfidf_keywords = calculate_tfidf_corpus(
+                short_texts, tf_top_n, tf_documents=tf_documents, idf_scores=idf_scores
+            )
+            tfdf_keywords = calculate_tfdf_corpus(
+                short_texts, tf_top_n, tf_documents=tf_documents, mean_tf=mean_tf
+            )
             yake_keywords_long = extract_kw_yake_corpus(long_texts, yake_top_n, yake_final_n)
             yake_keywords_short = extract_kw_yake_corpus(short_texts, yake_top_n, yake_final_n)
             
@@ -231,7 +256,8 @@ class TopicModeler:
                  texts: List[List[str]], 
                  clusters: List[int],
                  designators: Optional[Dict[str, str]] = None,
-                 use_gpu: bool = True):
+                 use_gpu: bool = True,
+                 designator_profile: Optional[str] = None):
         """
         Initialize the TopicModeler with tokenized texts and cluster assignments.
         
@@ -240,11 +266,12 @@ class TopicModeler:
                 be a list of tokens (words).
             clusters (List[int]): Cluster assignment for each document. Must be the
                 same length as texts.
-            designators (Optional[Dict[str, str]], optional): Dictionary mapping designator
-                names to their descriptions. If None, uses default aviation safety designators.
-                Defaults to None.
+            designators (Optional[Dict[str, str]], optional): Mapping of domain-specific
+                labels to descriptions. If omitted, topics are left unmatched.
             use_gpu (bool, optional): Whether to use GPU acceleration for BERT computations
                 if available. Defaults to True.
+            designator_profile (Optional[str]): Optional built-in domain profile. The
+                only supported profile is 'aviation'; omitted means domain-neutral.
         
         Raises:
             ValueError: If texts or clusters are empty, or if their lengths don't match.
@@ -255,11 +282,19 @@ class TopicModeler:
         self.dictionary = None
         self.corpus = None
         self.lda_model = None
-        self.designators = designators if designators else self._default_designators()
+        if designator_profile not in (None, 'aviation'):
+            raise ValueError("designator_profile must be None or 'aviation'")
+        if designators is not None and designator_profile is not None:
+            raise ValueError("Pass either designators or designator_profile, not both")
+        self.designators = (
+            designators if designators is not None else
+            self._default_designators() if designator_profile == 'aviation' else {}
+        )
         self.tokenizer = None
         self.bert_model = None
         self.device = self._setup_device(use_gpu)
         self.embedding_cache = {}
+        self.topic_match_metadata = {}
     
     def _validate_inputs(self, texts: List[List[str]], clusters: List[int]):
         """
@@ -415,13 +450,19 @@ class TopicModeler:
             raise ValueError("LDA model not trained yet. Call train_lda() first.")
         
         cluster_topics = {}
-        unique_clusters = set(self.clusters)
+        # Group once instead of rescanning all labels separately for each
+        # cluster (O(N) rather than O(N * number_of_clusters)).
+        cluster_indices_by_id = defaultdict(list)
+        for idx, cluster_id in enumerate(self.clusters):
+            # HDBSCAN reserves -1 for noise; it is not an analytical cluster.
+            if cluster_id == -1:
+                continue
+            cluster_indices_by_id[cluster_id].append(idx)
+        unique_clusters = cluster_indices_by_id
         
         logger.info(f"Computing topics for {len(unique_clusters)} clusters")
         
-        for cluster_id in unique_clusters:
-            # Get indices of texts in this cluster
-            cluster_indices = [i for i, c in enumerate(self.clusters) if c == cluster_id]
+        for cluster_id, cluster_indices in unique_clusters.items():
             
             # Compute average topic probabilities incrementally
             topic_sums = defaultdict(float)
@@ -457,6 +498,15 @@ class TopicModeler:
         """
         if self.tokenizer is None or self.bert_model is None:
             logger.info(f"Loading BERT model: {model_name}")
+            global BertTokenizer, BertModel
+            if BertTokenizer is None or BertModel is None:
+                try:
+                    from transformers import BertTokenizer as _BertTokenizer, BertModel as _BertModel
+                    BertTokenizer, BertModel = _BertTokenizer, _BertModel
+                except ImportError as exc:
+                    raise ImportError(
+                        "BERT designator matching requires a compatible transformers installation."
+                    ) from exc
             self.tokenizer = BertTokenizer.from_pretrained(model_name)
             self.bert_model = BertModel.from_pretrained(model_name)
             self.bert_model.to(self.device)
@@ -533,7 +583,8 @@ class TopicModeler:
     
     def match_designators_to_topics(self, 
                                    num_words: int = 10, 
-                                   top_k: int = 3) -> Dict[int, List[Tuple[str, float]]]:
+                                   top_k: int = 3,
+                                   min_similarity: float = 0.5) -> Dict[int, List[Tuple[str, float]]]:
         """
         Match predefined designators to discovered topics using BERT embedding similarity.
         
@@ -546,6 +597,9 @@ class TopicModeler:
                 Defaults to 10.
             top_k (int, optional): Number of top matching designators to return for each topic.
                 Defaults to 3.
+            min_similarity (float): Minimum cosine similarity required for a match.
+                Topics below the threshold return an empty list. This is an exploratory
+                starting threshold and should be calibrated for the chosen domain/model.
         
         Returns:
             Dict[int, List[Tuple[str, float]]]: Dictionary mapping topic IDs to lists of
@@ -556,19 +610,31 @@ class TopicModeler:
         """
         if self.lda_model is None:
             raise ValueError("LDA model not trained yet. Call train_lda() first.")
+        if not isinstance(top_k, int) or top_k < 1:
+            raise ValueError("top_k must be a positive integer")
+        if not np.isfinite(min_similarity) or not -1 <= min_similarity <= 1:
+            raise ValueError("min_similarity must be between -1 and 1")
         
         logger.info("Computing designator-topic matches using BERT embeddings")
         
         # Get embeddings for all designators (with caching)
         designator_list = list(self.designators.keys())
-        designator_embeddings = np.vstack([
+        designator_embeddings = (np.vstack([
             self.get_bert_embedding(self.designators[designator], use_cache=True)
             for designator in designator_list
-        ])
+        ]) if designator_list else None)
         
         # Get embeddings for all topics and compute similarities
         topic_designators = {}
+        self.topic_match_metadata = {}
         for topic_id in range(self.lda_model.num_topics):
+            if not designator_list:
+                topic_designators[topic_id] = []
+                self.topic_match_metadata[topic_id] = {
+                    'matched': False, 'best_similarity': None,
+                    'threshold': float(min_similarity)
+                }
+                continue
             topic_words = self.get_topic_words(topic_id, num_words)
             topic_text = " ".join(topic_words)
             topic_embedding = self.get_bert_embedding(topic_text, use_cache=True)
@@ -578,10 +644,17 @@ class TopicModeler:
             
             # Get top k designators
             top_indices = np.argsort(similarities)[-top_k:][::-1]
+            best_similarity = float(similarities[top_indices[0]]) if len(top_indices) else None
+            matched_indices = [idx for idx in top_indices if similarities[idx] >= min_similarity]
             topic_designators[topic_id] = [
                 (designator_list[idx], similarities[idx]) 
-                for idx in top_indices
+                for idx in matched_indices
             ]
+            self.topic_match_metadata[topic_id] = {
+                'matched': bool(matched_indices),
+                'best_similarity': best_similarity,
+                'threshold': float(min_similarity)
+            }
         
         logger.info("Designator matching complete")
         return topic_designators

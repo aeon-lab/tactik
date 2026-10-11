@@ -431,6 +431,20 @@ class TestLoadSpacyModel(unittest.TestCase):
         
         with self.assertRaises(OSError):
             load_spacy_model(use_cache=False)
+
+    @patch('preprocessing.spacy.load')
+    def test_use_cache_false_does_not_store_model(self, mock_spacy_load):
+        mock_nlp = Mock()
+        mock_nlp.pipe_names = ['ner']
+        mock_nlp.disable_pipes = Mock()
+        mock_spacy_load.return_value = mock_nlp
+        clear_spacy_cache()
+
+        load_spacy_model(use_cache=False)
+        load_spacy_model(use_cache=False)
+
+        self.assertEqual(mock_spacy_load.call_count, 2)
+        self.assertEqual(clear_spacy_cache(), 0)
     
     def test_invalid_disable_pipes_type(self):
         """Test invalid disable_pipes type."""
@@ -719,19 +733,17 @@ class TestBatchPreprocess(unittest.TestCase):
         self.assertEqual(len(result), 0)
     
     @patch('preprocessing.load_spacy_model')
-    @patch('preprocessing.preprocess_text')
     @patch('preprocessing.handle_punctuation')
     @patch('preprocessing.remove_num')
     @patch('preprocessing.remove_words_dict')
     @patch('preprocessing.calculate_idf')
     def test_custom_text_column(self, mock_idf, mock_remove_words,
                                 mock_remove_num, mock_punctuation,
-                                mock_preprocess, mock_load):
+                                mock_load):
         """Test with custom text column."""
         # Setup mocks
         mock_nlp = create_mock_spacy_model()
         mock_load.return_value = mock_nlp
-        mock_preprocess.side_effect = lambda x: x.lower() if isinstance(x, str) else ""
         mock_punctuation.side_effect = lambda x: x
         mock_remove_num.side_effect = lambda x: x
         mock_remove_words.side_effect = lambda text, words: text
@@ -742,6 +754,8 @@ class TestBatchPreprocess(unittest.TestCase):
         
         self.assertIsInstance(result, pd.DataFrame)
         self.assertIn('Final_Processed', result.columns)
+        self.assertEqual(result.loc[3, 'processed'], '')
+        self.assertEqual(result.loc[3, 'processed_num_Narr'], '')
 
 
 # ============================================================================

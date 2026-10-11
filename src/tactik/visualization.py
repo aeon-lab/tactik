@@ -190,37 +190,34 @@ def plot_clusters(
     
     # Get unique clusters
     unique_clusters = np.unique(labels)
+    regular_clusters = [label for label in unique_clusters if label != -1]
     
     # Generate or validate palette and markers
     if palette is None:
-        n_clusters = len(unique_clusters) if -1 not in unique_clusters else len(unique_clusters) - 1
-        palette = get_cluster_palette(n_clusters)
-        # Add gray color for outliers if they exist and we're showing them
-        if show_outliers and -1 in unique_clusters:
-            palette = list(palette) + [(0.5, 0.5, 0.5)]  # Add gray for outliers
+        palette = get_cluster_palette(len(regular_clusters)) if regular_clusters else []
+    elif regular_clusters and not palette:
+        raise ValueError("palette cannot be empty when regular clusters are present")
+
+    cluster_colors = {
+        cluster: palette[index % len(palette)]
+        for index, cluster in enumerate(regular_clusters)
+    } if regular_clusters else {}
     
     if markers is None:
         # Use only filled markers to avoid seaborn's mixed marker restriction
         filled_markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', 'H', '8']
-        markers = {}
-        for i, label in enumerate(unique_clusters):
-            if label == -1:
-                # For outliers, use a filled marker that stands out
-                markers[-1] = 'D'  # Diamond marker for outliers
-            else:
-                # Get the index for regular clusters (skip -1)
-                cluster_idx = list(unique_clusters).index(label)
-                if label == -1:
-                    actual_idx = cluster_idx - 1
-                else:
-                    actual_idx = cluster_idx
-                markers[label] = filled_markers[actual_idx % len(filled_markers)]
+        markers = {
+            label: filled_markers[index % len(filled_markers)]
+            for index, label in enumerate(regular_clusters)
+        }
+        if -1 in unique_clusters:
+            markers[-1] = 'D'
     
     # Create a single figure and axis
     fig, ax = plt.subplots(figsize=(10, 8))
     
     # Plot each cluster separately
-    for i, cluster_label in enumerate(unique_clusters):
+    for cluster_label in unique_clusters:
         mask = labels == cluster_label
         if np.any(mask):
             cluster_embeddings = embeddings[mask]
@@ -231,9 +228,7 @@ def plot_clusters(
                 color = (0.5, 0.5, 0.5)
                 label_name = 'Outliers'
             else:
-                # Get color from palette based on cluster index
-                color_idx = i if cluster_label != -1 else len(palette) - 1
-                color = palette[color_idx % len(palette)]
+                color = cluster_colors[cluster_label]
                 label_name = f'Cluster {cluster_label}'
             
             ax.scatter(
@@ -432,12 +427,23 @@ def plot_cluster_comparison(
     
     # Left subplot: Cluster assignments
     unique_clusters = np.unique(cluster_labels[cluster_labels != -1])
-    n_clusters = len(unique_clusters)
-    cluster_palette = get_cluster_palette(n_clusters)
-    cluster_markers = get_cluster_markers(n_clusters)
-    cluster_markers = {label: cluster_markers[i] for i, label in enumerate(unique_clusters)}
+    cluster_colors = get_cluster_palette(len(unique_clusters)) if len(unique_clusters) else []
+    cluster_palette = {
+        label: cluster_colors[index]
+        for index, label in enumerate(unique_clusters)
+    }
+    cluster_markers = get_cluster_markers(max(1, len(unique_clusters)))
+    cluster_markers = {
+        label: cluster_markers[index]
+        for index, label in enumerate(unique_clusters)
+    }
     if -1 in cluster_labels:
-        cluster_markers[-1] = 'x'
+        # A filled diamond keeps seaborn's marker set compatible across all
+        # categories while still making noise visually distinct.
+        cluster_palette[-1] = (0.5, 0.5, 0.5)
+        cluster_markers[-1] = 'D'
+    elif not unique_clusters.size:
+        raise ValueError("At least one cluster or outlier is required")
     
     sns.scatterplot(
         x=embeddings[:, 0],

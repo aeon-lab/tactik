@@ -1,27 +1,50 @@
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
+import logging
 import pandas as pd
 import numpy as np
+from scipy.sparse import spmatrix
 import matplotlib.pyplot as plt
+
+logger = logging.getLogger(__name__)
 try:
     from .preprocessing import pre_processing_routine, remove_stopwords_corpus, define_stopwords
     from .clustering_tuning import full_clustering_pipeline, full_clustering_pipeline_fixed_params
+    from .clustering_tuning import DEFAULT_UMAP_GRID, DEFAULT_HDBSCAN_GRID, DEFAULT_MAX_PAIRWISE_MEMORY_MB
     from .visualization import plot_clusters, plot_clusters_with_annotations
     from .embeddings import vectorize_text
 except ImportError:
     from preprocessing import pre_processing_routine, remove_stopwords_corpus, define_stopwords
     from clustering_tuning import full_clustering_pipeline, full_clustering_pipeline_fixed_params
+    from clustering_tuning import DEFAULT_UMAP_GRID, DEFAULT_HDBSCAN_GRID, DEFAULT_MAX_PAIRWISE_MEMORY_MB
     from visualization import plot_clusters, plot_clusters_with_annotations
     from embeddings import vectorize_text
 
-# Import these at module level so they can be mocked in tests
-try:
-    from .topic_extraction import KeywordExtractor, TopicModeler
-except ImportError:
-    try:
-        from topic_extraction import KeywordExtractor, TopicModeler
-    except ImportError:
-        KeywordExtractor = None
-        TopicModeler = None
+class _LazyTopicClass:
+    """Resolve topic classes only when topic functionality is requested."""
+    class_name = None
+
+    def __new__(cls, *args, **kwargs):
+        try:
+            from . import topic_extraction
+        except ImportError:
+            import topic_extraction
+        implementation = getattr(topic_extraction, cls.class_name)
+        return implementation(*args, **kwargs)
+
+
+class KeywordExtractor(_LazyTopicClass):
+    class_name = "KeywordExtractor"
+
+
+class TopicModeler(_LazyTopicClass):
+    class_name = "TopicModeler"
+
+
+def _resolve_umap_metric(metric, umap_metric):
+    """Keep the legacy metric argument as a UMAP-only alias."""
+    if metric is not None and umap_metric is not None and metric != umap_metric:
+        raise ValueError("metric and umap_metric must agree when both are supplied")
+    return umap_metric if umap_metric is not None else (metric if metric is not None else 'cosine')
 
 
 class ClusteringPipeline:
@@ -45,6 +68,8 @@ class ClusteringPipeline:
         self._df_modified = False
         self._vectorized_text = None  # Cache vectorization
         self._stopwords = None  # Cache stopwords
+        self._stopwords_params_key = None
+        self._generated_columns = set()
         self.clustering_results = None
         self.keywords = None
         self.topics = None
@@ -54,8 +79,32 @@ class ClusteringPipeline:
         if not self._df_modified:
             self.df = self.df.copy()
             self._df_modified = True
+
+    def _invalidate_analysis_state(self):
+        """Clear cached results and columns derived from an earlier analysis."""
+        self._vectorized_text = None
+        self._stopwords = None
+        self._stopwords_params_key = None
+        self.clustering_results = None
+        self.keywords = None
+        self.topics = None
+        if self._generated_columns:
+            self.df.drop(columns=list(self._generated_columns), inplace=True, errors='ignore')
+            self._generated_columns.clear()
+
+    def _invalidate_clustering_state(self):
+        """Discard results and derived labels before a new clustering run."""
+        self.clustering_results = None
+        self.keywords = None
+        self.topics = None
+        if self._generated_columns or 'Clusters' in self.df.columns:
+            self._ensure_df_copy()
+        columns_to_clear = set(self._generated_columns)
+        columns_to_clear.add('Clusters')
+        self.df.drop(columns=list(columns_to_clear), inplace=True, errors='ignore')
+        self._generated_columns.clear()
     
-    def _get_vectorized_text(self, force_recompute: bool = False) -> np.ndarray:
+    def _get_vectorized_text(self, force_recompute: bool = False) -> Union[np.ndarray, spmatrix]:
         """
         Get or compute vectorized text, with caching.
         
@@ -63,7 +112,7 @@ class ClusteringPipeline:
             force_recompute: Force recomputation even if cached
             
         Returns:
-            Vectorized text array
+            Cached feature matrix (sparse CSR for the default TF-IDF vectorizer).
         """
         if self._vectorized_text is None or force_recompute:
             if 'processed_stopword_Narr' not in self.df.columns:
@@ -101,6 +150,10 @@ class ClusteringPipeline:
         """
         # Only copy if we haven't already
         self._ensure_df_copy()
+
+        # Reprocessing may change every downstream result, so discard state
+        # produced by the previous preprocessing/clustering pass first.
+        self._invalidate_analysis_state()
         
         # Run preprocessing routine
         self.df['processed'], self.df['processed_num_Narr'] = pre_processing_routine(self.df, text_column=self.text_column)
@@ -140,28 +193,35 @@ class ClusteringPipeline:
     def cluster_data(self,
                 n_neighbors: int = 10,
                 min_dist: float = 0.0,
-                metric: str = 'cosine',
+                metric: Optional[str] = None,
                 n_components: int = 5,
                 min_cluster_size: int = 10,
                 cluster_selection_method: str = 'eom',
-                standardize: bool = True,
-                compute_tsne: bool = True,
+                standardize: bool = False,
+                compute_tsne: bool = False,
                 tsne_perplexity: int = 30,
                 tsne_early_exaggeration: int = 12,
                 tsne_learning_rate: int = 200,
-                random_state: Optional[int] = None) -> Dict[str, Any]:
+                random_state: Optional[int] = None,
+                *,
+                umap_metric: Optional[str] = None,
+                hdbscan_metric: str = 'euclidean',
+                max_pairwise_memory_mb: float = DEFAULT_MAX_PAIRWISE_MEMORY_MB) -> Dict[str, Any]:
         """
         Perform clustering with specified parameters (no tuning).
     
         Args:
             n_neighbors: UMAP neighborhood size
             min_dist: UMAP minimum distance
-            metric: Distance metric
+            metric: Legacy alias for umap_metric; no longer sets HDBSCAN's metric.
+            umap_metric: UMAP input distance, default 'cosine'.
+            hdbscan_metric: Distance on reduced coordinates, default 'euclidean'.
+            max_pairwise_memory_mb: Cosine distance-matrix limit in MiB, excluding workspace.
             n_components: Number of UMAP components
             min_cluster_size: HDBSCAN minimum cluster size
             cluster_selection_method: HDBSCAN cluster selection method
-            standardize: Whether to standardize data before clustering
-            compute_tsne: Whether to compute t-SNE embeddings for visualization
+            standardize: Opt-in feature scaling; sparse TF-IDF is never centered.
+            compute_tsne: Opt-in t-SNE computation for visualization.
             tsne_perplexity: t-SNE perplexity
             tsne_early_exaggeration: t-SNE early exaggeration
             tsne_learning_rate: t-SNE learning rate
@@ -171,6 +231,8 @@ class ClusteringPipeline:
             Dictionary containing clustering results
         """
         # Get vectorized text (uses cache if available)
+        umap_metric = _resolve_umap_metric(metric, umap_metric)
+        self._invalidate_clustering_state()
         X = self._get_vectorized_text()
         
         # Use instance random state if not provided
@@ -182,12 +244,12 @@ class ClusteringPipeline:
             umap_params={
                 'n_neighbors': n_neighbors,
                 'min_dist': min_dist,
-                'metric': metric,
+                'metric': umap_metric,
                 'n_components': n_components
             },
             hdbscan_params={
                 'min_cluster_size': min_cluster_size,
-                'metric': metric,
+                'metric': hdbscan_metric,
                 'cluster_selection_method': cluster_selection_method
             },
             tsne_params={
@@ -200,7 +262,8 @@ class ClusteringPipeline:
             standardize=standardize,
             compute_tsne=compute_tsne,
             progress=True,
-            random_state=rs
+            random_state=rs,
+            max_pairwise_memory_mb=max_pairwise_memory_mb
         )
     
         # Add clusters to DataFrame
@@ -208,25 +271,32 @@ class ClusteringPipeline:
             self.clustering_results['clustering_results'] is not None):
             self._ensure_df_copy()
             self.df['Clusters'] = self.clustering_results['clustering_results']['clusters']
+            self._generated_columns.add('Clusters')
     
         return self.clustering_results
     
     def cluster_and_analyze_topics(self,
                                   n_neighbors: int = 10,
                                   min_dist: float = 0.0,
-                                  metric: str = 'cosine',
+                                  metric: Optional[str] = None,
                                   n_components: int = 5,
                                   min_cluster_size: int = 10,
                                   cluster_selection_method: str = 'eom',
-                                  standardize: bool = True,
-                                  compute_tsne: bool = True,
+                                  standardize: bool = False,
+                                  compute_tsne: bool = False,
                                   tsne_perplexity: int = 30,
                                   tsne_early_exaggeration: int = 12,
                                   tsne_learning_rate: int = 200,
                                   num_topics: int = 15,
                                   passes: int = 15,
                                   designators: Optional[Dict] = None,
-                                  random_state: Optional[int] = None) -> Dict[str, Any]:
+                                  designator_profile: Optional[str] = None,
+                                  min_similarity: float = 0.5,
+                                  random_state: Optional[int] = None,
+                                  *,
+                                  umap_metric: Optional[str] = None,
+                                  hdbscan_metric: str = 'euclidean',
+                                  max_pairwise_memory_mb: float = DEFAULT_MAX_PAIRWISE_MEMORY_MB) -> Dict[str, Any]:
         """
         Perform clustering and LDA topic modeling in one integrated step.
         
@@ -236,7 +306,10 @@ class ClusteringPipeline:
         Args:
             n_neighbors: UMAP neighborhood size
             min_dist: UMAP minimum distance
-            metric: Distance metric
+            metric: Legacy alias for umap_metric; no longer sets HDBSCAN's metric.
+            umap_metric: UMAP input distance, default 'cosine'.
+            hdbscan_metric: Distance on reduced coordinates, default 'euclidean'.
+            max_pairwise_memory_mb: Cosine distance-matrix limit in MiB, excluding workspace.
             n_components: Number of UMAP components
             min_cluster_size: HDBSCAN minimum cluster size
             cluster_selection_method: HDBSCAN cluster selection method
@@ -248,6 +321,9 @@ class ClusteringPipeline:
             num_topics: Number of LDA topics to extract
             passes: Number of LDA training passes
             designators: Optional dictionary for topic-to-designator matching
+            designator_profile: Optional built-in domain profile, currently 'aviation'.
+                Omit for domain-neutral topics that may remain unmatched.
+            min_similarity: Minimum cosine similarity required to assign a designator.
             random_state: Random state for reproducibility. If None, uses instance random_state
             
         Returns:
@@ -275,7 +351,10 @@ class ClusteringPipeline:
             tsne_perplexity=tsne_perplexity,
             tsne_early_exaggeration=tsne_early_exaggeration,
             tsne_learning_rate=tsne_learning_rate,
-            random_state=rs
+            random_state=rs,
+            umap_metric=umap_metric,
+            hdbscan_metric=hdbscan_metric,
+            max_pairwise_memory_mb=max_pairwise_memory_mb
         )
         
         print("Step 2/3: Performing LDA topic modeling...")
@@ -285,6 +364,8 @@ class ClusteringPipeline:
             num_topics=num_topics,
             passes=passes,
             designators=designators,
+            designator_profile=designator_profile,
+            min_similarity=min_similarity,
             random_state=rs
         )
         
@@ -311,19 +392,23 @@ class ClusteringPipeline:
     def cluster_and_extract_keywords(self,
                                     n_neighbors: int = 10,
                                     min_dist: float = 0.0,
-                                    metric: str = 'cosine',
+                                    metric: Optional[str] = None,
                                     n_components: int = 5,
                                     min_cluster_size: int = 10,
                                     cluster_selection_method: str = 'eom',
-                                    standardize: bool = True,
-                                    compute_tsne: bool = True,
+                                    standardize: bool = False,
+                                    compute_tsne: bool = False,
                                     tsne_perplexity: int = 30,
                                     tsne_early_exaggeration: int = 12,
                                     tsne_learning_rate: int = 200,
                                     tf_top_n: int = 5,
                                     yake_top_n: int = 10,
                                     yake_final_n: int = 5,
-                                    random_state: Optional[int] = None) -> Dict[str, Any]:
+                                    random_state: Optional[int] = None,
+                                    *,
+                                    umap_metric: Optional[str] = None,
+                                    hdbscan_metric: str = 'euclidean',
+                                    max_pairwise_memory_mb: float = DEFAULT_MAX_PAIRWISE_MEMORY_MB) -> Dict[str, Any]:
         """
         Perform clustering and keyword extraction in one integrated step.
         
@@ -333,7 +418,10 @@ class ClusteringPipeline:
         Args:
             n_neighbors: UMAP neighborhood size
             min_dist: UMAP minimum distance
-            metric: Distance metric
+            metric: Legacy alias for umap_metric; no longer sets HDBSCAN's metric.
+            umap_metric: UMAP input distance, default 'cosine'.
+            hdbscan_metric: Distance on reduced coordinates, default 'euclidean'.
+            max_pairwise_memory_mb: Cosine distance-matrix limit in MiB, excluding workspace.
             n_components: Number of UMAP components
             min_cluster_size: HDBSCAN minimum cluster size
             cluster_selection_method: HDBSCAN cluster selection method
@@ -371,7 +459,10 @@ class ClusteringPipeline:
             tsne_perplexity=tsne_perplexity,
             tsne_early_exaggeration=tsne_early_exaggeration,
             tsne_learning_rate=tsne_learning_rate,
-            random_state=rs
+            random_state=rs,
+            umap_metric=umap_metric,
+            hdbscan_metric=hdbscan_metric,
+            max_pairwise_memory_mb=max_pairwise_memory_mb
         )
         
         print("Step 2/2: Extracting keywords...")
@@ -405,9 +496,19 @@ class ClusteringPipeline:
                         time_limit: int = 600,
                         max_iterations: int = 50,
                         target_metric: str = 'davies_bouldin',
-                        standardize: bool = True,
+                        standardize: bool = False,
                         tune_tsne: bool = False,
-                        random_state: Optional[int] = None) -> Dict[str, Any]:
+                        random_state: Optional[int] = None,
+                        *,
+                        compute_tsne: bool = False,
+                        tsne_perplexity: int = 30,
+                        tsne_early_exaggeration: int = 12,
+                        tsne_learning_rate: int = 200,
+                        min_coverage: float = 0.5,
+                        umap_metric: Optional[str] = None,
+                        hdbscan_metric: str = 'euclidean',
+                        metric: Optional[str] = None,
+                        max_pairwise_memory_mb: float = DEFAULT_MAX_PAIRWISE_MEMORY_MB) -> Dict[str, Any]:
         """
         Perform clustering with hyperparameter tuning.
         
@@ -417,15 +518,33 @@ class ClusteringPipeline:
             max_iterations: Maximum tuning iterations
             target_metric: Metric to optimize ('davies_bouldin' or 'calinski_harabasz')
             standardize: Whether to standardize data before clustering
-            tune_tsne: Whether to also tune t-SNE parameters
+            tune_tsne: Unsupported; True raises ValueError because t-SNE is not scored.
             random_state: Random state for reproducibility. If None, uses instance random_state
+            compute_tsne: Opt-in computation of final t-SNE coordinates.
+            tsne_perplexity: Perplexity for fixed t-SNE parameters.
+            tsne_early_exaggeration: Early exaggeration for fixed t-SNE parameters.
+            tsne_learning_rate: Learning rate for fixed t-SNE parameters.
+            umap_metric: UMAP input distance, default 'cosine'.
+            hdbscan_metric: HDBSCAN distance, default 'euclidean'.
+            metric: Legacy UMAP-only alias, consistent with cluster_data().
+            max_pairwise_memory_mb: Cosine distance-matrix limit in MiB, excluding workspace.
+            min_coverage: Minimum share of documents assigned to clusters for a tuning
+                candidate to be eligible.
             
         Returns:
             Dictionary containing clustering results
         """
         # Use instance random state if not provided
         rs = random_state if random_state is not None else self.random_state
+
+        if tune_tsne:
+            raise ValueError(
+                "tune_tsne is unsupported: clustering search evaluates UMAP/HDBSCAN only. "
+                "Tune t-SNE separately for visualization."
+            )
         
+        umap_metric = _resolve_umap_metric(metric, umap_metric)
+        self._invalidate_clustering_state()
         # Get vectorized text (uses cache if available)
         X = self._get_vectorized_text()
         
@@ -439,7 +558,19 @@ class ClusteringPipeline:
             target_metric=target_metric,
             progress=True,
             tune_tsne=tune_tsne,
-            random_state=rs
+            random_state=rs,
+            compute_tsne=compute_tsne,
+            tsne_params={
+                'perplexity': tsne_perplexity,
+                'early_exaggeration': tsne_early_exaggeration,
+                'learning_rate': tsne_learning_rate,
+                'n_components': 2,
+                'random_state': rs
+            },
+            umap_param_grid=dict(DEFAULT_UMAP_GRID, metric=[umap_metric]),
+            hdbscan_param_grid=dict(DEFAULT_HDBSCAN_GRID, metric=[hdbscan_metric]),
+            max_pairwise_memory_mb=max_pairwise_memory_mb,
+            min_coverage=min_coverage
         )
         
         # Add clusters to DataFrame
@@ -447,6 +578,7 @@ class ClusteringPipeline:
             self.clustering_results['clustering_results'] is not None):
             self._ensure_df_copy()
             self.df['Clusters'] = self.clustering_results['clustering_results']['clusters']
+            self._generated_columns.add('Clusters')
         
         return self.clustering_results
     
@@ -519,9 +651,6 @@ class ClusteringPipeline:
             raise ValueError("No cluster assignments found. Run clustering first.")
         
         # Use module-level import if available
-        if KeywordExtractor is None:
-            raise ImportError("KeywordExtractor not available. Check topic_extraction module.")
-        
         # KeywordExtractor expects both 'Narratives' and 'Narrative_long' columns
         # Create 'Narratives' column if it doesn't exist (use processed text or original)
         if 'Narratives' not in self.df.columns:
@@ -533,6 +662,7 @@ class ClusteringPipeline:
                 self.df['Narratives'] = self.df['processed']
             else:
                 self.df['Narratives'] = self.df[self.text_column]
+            self._generated_columns.add('Narratives')
         
         extractor = KeywordExtractor(self.df, narrative_long_col=self.text_column)
         self.keywords = extractor.extract_keywords_per_cluster(
@@ -546,6 +676,8 @@ class ClusteringPipeline:
                       num_topics: int = 15,
                       passes: int = 15,
                       designators: Optional[Dict] = None,
+                      designator_profile: Optional[str] = None,
+                      min_similarity: float = 0.5,
                       random_state: Optional[int] = None) -> Dict:
         """
         Perform topic modeling and match topics to designators.
@@ -554,6 +686,9 @@ class ClusteringPipeline:
             num_topics: Number of LDA topics
             passes: Number of LDA passes
             designators: Custom designator dictionary
+            designator_profile: Optional built-in domain profile, currently 'aviation'.
+                Omit for domain-neutral topics that may remain unmatched.
+            min_similarity: Minimum cosine similarity required to assign a designator.
             random_state: Random state for reproducibility. If None, uses instance random_state
             
         Returns:
@@ -568,29 +703,35 @@ class ClusteringPipeline:
         # Check if preprocessing was done
         if 'processed_stopword_Narr' not in self.df.columns:
             raise ValueError("Data must be preprocessed first. Call preprocess_data().")
+
+        # HDBSCAN's -1 label means noise, not a meaningful topic cluster.
+        # Keep those documents out of both LDA fitting and cluster summaries.
+        topic_rows = self.df['Clusters'] != -1
+        if not topic_rows.any():
+            raise ValueError("Topic analysis requires at least one non-noise cluster.")
         
         # Use module-level import if available
-        if TopicModeler is None:
-            raise ImportError("TopicModeler not available. Check topic_extraction module.")
-        
         # Tokenize using vectorized string operation (faster than apply)
         if 'Processed_Narrative' not in self.df.columns:
             self._ensure_df_copy()
             self.df['Processed_Narrative'] = self.df['processed_stopword_Narr'].str.split()
+            self._generated_columns.add('Processed_Narrative')
         
         modeler = TopicModeler(
-            texts=self.df['Processed_Narrative'].tolist(),
-            clusters=self.df['Clusters'].tolist(),
-            designators=designators
+            texts=self.df.loc[topic_rows, 'Processed_Narrative'].tolist(),
+            clusters=self.df.loc[topic_rows, 'Clusters'].tolist(),
+            designators=designators,
+            designator_profile=designator_profile
         )
         
         modeler.train_lda(num_topics=num_topics, passes=passes, random_state=rs)
         cluster_topics = modeler.get_cluster_topics()
-        topic_designators = modeler.match_designators_to_topics()
+        topic_designators = modeler.match_designators_to_topics(min_similarity=min_similarity)
         
         self.topics = {
             'cluster_topics': cluster_topics,
             'topic_designators': topic_designators,
+            'topic_match_metadata': getattr(modeler, 'topic_match_metadata', {}),
             'model': modeler
         }
         
@@ -598,7 +739,7 @@ class ClusteringPipeline:
     
     def full_pipeline(self,
                       tune_hyperparameters: bool = False,
-                      visualize: bool = True,
+                      visualize: bool = False,
                       extract_keywords: bool = True,
                       analyze_topics: bool = True,
                       min_clusters: int = 3,
@@ -610,13 +751,17 @@ class ClusteringPipeline:
         
         Args:
             tune_hyperparameters: Whether to perform hyperparameter tuning
-            visualize: Whether to show/save visualizations
+            visualize: Whether to show/save visualizations. Set compute_tsne=True
+                       explicitly to calculate t-SNE coordinates.
             extract_keywords: Whether to extract keywords
             analyze_topics: Whether to perform topic analysis
             min_clusters: Minimum clusters required (for tuning)
             time_limit: Tuning time limit in seconds
             random_state: Random state for reproducibility. If None, uses instance random_state
-            **kwargs: Additional arguments for preprocessing/clustering
+            **kwargs: Additional preprocessing/clustering arguments, including
+                      umap_metric, hdbscan_metric, standardize, compute_tsne,
+                      tsne_perplexity, tsne_early_exaggeration, tsne_learning_rate,
+                      max_pairwise_memory_mb, min_coverage, and max_iterations (tuning only).
             
         Returns:
             Dictionary containing all results
@@ -625,6 +770,7 @@ class ClusteringPipeline:
         rs = random_state if random_state is not None else self.random_state
         
         results = {}
+        errors = {}
         
         # 1. Preprocessing
         print("Step 1/5: Preprocessing data...")
@@ -634,31 +780,41 @@ class ClusteringPipeline:
         
         # 2. Clustering
         print("Step 2/5: Clustering data...")
+        compute_tsne = kwargs.get('compute_tsne', visualize)
+        common_options = {
+            'metric', 'umap_metric', 'hdbscan_metric', 'standardize',
+            'tsne_perplexity', 'tsne_early_exaggeration', 'tsne_learning_rate',
+            'max_pairwise_memory_mb', 'min_coverage'
+        }
         if tune_hyperparameters:
             clustering_kwargs = {k: v for k, v in kwargs.items() 
-                               if k in ['target_metric', 'standardize', 'tune_tsne']}
+                               if k in common_options | {'target_metric', 'tune_tsne',
+                                                         'tsne_param_grid', 'max_iterations'}}
             results['clustering'] = self.tune_and_cluster(
                 min_clusters=min_clusters,
                 time_limit=time_limit,
                 random_state=rs,
+                compute_tsne=compute_tsne,
                 **clustering_kwargs
             )
         else:
             clustering_kwargs = {k: v for k, v in kwargs.items() 
-                               if k in ['n_neighbors', 'min_dist', 'metric', 'n_components',
-                                       'min_cluster_size', 'cluster_selection_method', 
-                                       'standardize']}
-            results['clustering'] = self.cluster_data(random_state=rs, **clustering_kwargs)
+                               if k in common_options | {'n_neighbors', 'min_dist', 'n_components',
+                                                         'min_cluster_size', 'cluster_selection_method'}}
+            results['clustering'] = self.cluster_data(
+                random_state=rs, compute_tsne=compute_tsne, **clustering_kwargs
+            )
         
         # 3. Visualization
-        if visualize:
+        if visualize and compute_tsne:
             print("Step 3/5: Visualizing clusters...")
             try:
                 viz_kwargs = {k: v for k, v in kwargs.items() 
                             if k in ['show_outliers', 'annotation_column', 'save_path']}
                 self.visualize_clusters(**viz_kwargs)
             except Exception as e:
-                print(f"Warning: Visualization failed: {e}")
+                logger.warning("Visualization failed: %s", e)
+                errors['visualization'] = f"{type(e).__name__}: {e}"
         else:
             print("Step 3/5: Skipping visualization...")
         
@@ -670,7 +826,8 @@ class ClusteringPipeline:
                                 if k in ['tf_top_n', 'yake_top_n', 'yake_final_n']}
                 results['keywords'] = self.extract_keywords(**keyword_kwargs)
             except Exception as e:
-                print(f"Warning: Keyword extraction failed: {e}")
+                logger.warning("Keyword extraction failed: %s", e)
+                errors['keywords'] = f"{type(e).__name__}: {e}"
                 results['keywords'] = None
         else:
             print("Step 4/5: Skipping keyword extraction...")
@@ -681,16 +838,20 @@ class ClusteringPipeline:
             print("Step 5/5: Analyzing topics...")
             try:
                 topic_kwargs = {k: v for k, v in kwargs.items() 
-                              if k in ['num_topics', 'passes', 'designators']}
+                              if k in ['num_topics', 'passes', 'designators',
+                                       'designator_profile', 'min_similarity']}
                 results['topics'] = self.analyze_topics(random_state=rs, **topic_kwargs)
             except Exception as e:
-                print(f"Warning: Topic analysis failed: {e}")
+                logger.warning("Topic analysis failed: %s", e)
+                errors['topics'] = f"{type(e).__name__}: {e}"
                 results['topics'] = None
         else:
             print("Step 5/5: Skipping topic analysis...")
             results['topics'] = None
         
         results['dataframe'] = self.df
+        if errors:
+            results['errors'] = errors
         print("\nPipeline complete!")
         
         return results
@@ -792,7 +953,7 @@ if __name__ == "__main__":
         min_cluster_size=5,          # Minimum points per cluster
         cluster_selection_method='eom',  # HDBSCAN method
         standardize=True,            # Standardize features
-        compute_tsne=True,           # Compute t-SNE for visualization
+        compute_tsne=False,          # Opt in to the expensive t-SNE visualization
         # Keyword extraction parameters
         tf_top_n=5,                  # Top TF-IDF terms per cluster
         yake_top_n=10,               # Initial YAKE keywords

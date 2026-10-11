@@ -78,15 +78,15 @@ Extract representative keywords from each cluster using multiple methods.
 - **YAKE**: Yet Another Keyword Extractor (long and short narratives)  
 
 ### 4. Topic Modeling
-Discover latent topics using LDA and match them to predefined designators.
+Discover latent topics using LDA. Topic labels are optional exploratory suggestions: supply domain-specific designators or explicitly select the built-in `aviation` profile. Matches below the configurable cosine-similarity threshold are left unmatched; the default threshold is 0.5 and should be calibrated for the domain and embedding model.
 
 **TopicModeler Class:**
 - `train_lda()` - Train Latent Dirichlet Allocation model  
 - `get_cluster_topics()` - Get top topics per cluster  
-- `match_designators_to_topics()` - Match topics to designators using BERT embeddings  
+- `match_designators_to_topics()` - Suggest designator matches using BERT embeddings; topics may remain unmatched
 - `get_bert_embedding()` - Compute BERT embeddings for semantic matching  
 
-**Default Aviation Safety Designators:**
+**Built-in aviation profile designators** (available by passing `designator_profile="aviation"`):
 - Inadequate or inaccurate knowledge  
 - Poor judgment and decision-making  
 - Failure to follow procedures  
@@ -137,6 +137,8 @@ Analysis
 ### Memory Optimization
 - DataFrame lazy copying  
 - Vectorization caching  
+- Sparse TF-IDF stays sparse through preprocessing and into UMAP
+- Euclidean HDBSCAN on reduced coordinates avoids an explicit all-pairs distance matrix
 - BERT embedding cache with `clear_cache()` method  
 - Incremental topic probability calculations  
 
@@ -148,6 +150,72 @@ For large datasets, consider:
 - Disabling t-SNE computation with `compute_tsne=False`  
 - Using fixed parameters instead of hyperparameter tuning  
 - Clearing BERT embedding cache periodically  
+
+### Sparse clustering and distance settings
+
+The `ClusteringPipeline` methods use cosine distance for UMAP and Euclidean
+distance for HDBSCAN by default. TF-IDF remains a sparse CSR matrix until UMAP
+produces the small, dense embedding. Neither clustering pipeline converts the
+document-vocabulary matrix to a dense array.
+
+```python
+from tactik.clustering_pipeline import ClusteringPipeline
+
+pipeline = ClusteringPipeline(df, text_column="text")
+pipeline.preprocess_data()
+result = pipeline.cluster_data(
+    umap_metric="cosine",
+    hdbscan_metric="euclidean",
+    standardize=False,
+    compute_tsne=False,
+)
+
+# The tuned path accepts the same distance, scaling, and visualization settings.
+tuned = pipeline.tune_and_cluster(
+    umap_metric="cosine",
+    hdbscan_metric="euclidean",
+    max_iterations=20,
+    compute_tsne=False,
+)
+```
+
+`standardize=False` and `compute_tsne=False` are now the defaults for
+`cluster_data()`, `tune_and_cluster()`, and the combined keyword/topic methods.
+When scaling is enabled, sparse input uses `StandardScaler(with_mean=False)`;
+dense input is still centered and scaled. The lower-level functions in
+`clustering_tuning` retain their existing `standardize=True` default and now
+skip t-SNE unless `compute_tsne=True` is requested. Their `preprocessed_data` result is now sparse
+when the input is sparse.
+
+`full_pipeline(visualize=False)` skips t-SNE by default. Set `visualize=True`
+to compute coordinates for a plot, or set `compute_tsne=True` to compute
+coordinates without plotting. Perplexity, early exaggeration, and
+learning-rate options are forwarded on both fixed and tuned paths; fixed
+t-SNE is computed only for visualization and is not part of UMAP/HDBSCAN clustering search. `tune_tsne=True` and `tsne_param_grid` now raise a clear error because those values were sampled without being evaluated. Use fixed `tsne_params` for visualization settings.
+
+When t-SNE receives sparse text features, it first applies TruncatedSVD to at
+most 50 components. This avoids materializing the full document-vocabulary
+matrix, though t-SNE still has document-count-dependent compute and memory costs.
+
+Clustering tuning reports assigned-document `coverage` and excludes candidates below `min_coverage` (default `0.5`) from selection. Set `min_coverage` to a value from 0 to 1 to adjust this eligibility cutoff. Davies-Bouldin and Calinski-Harabasz scores are still calculated on assigned documents only, so compare them alongside coverage.
+
+The legacy `metric=` argument remains an alias for **UMAP only**. Use
+`hdbscan_metric=` to select HDBSCAN's metric independently. Changing the old
+shared metric or disabling mean centering can change cluster assignments, so
+reassess results when migrating an existing analysis.
+
+Explicit `hdbscan_metric="cosine"` still requires a dense distance matrix.
+Before fitting UMAP or allocating that matrix, the code checks its float64
+size against `max_pairwise_memory_mb` (default **512 MiB**). The limit covers
+the distance matrix only; HDBSCAN needs additional working memory. An oversized
+fixed request raises `MemoryError`; tuning records an oversized trial in its
+error history and continues. Increase the limit explicitly only when memory
+allows. The default HDBSCAN search grid uses Euclidean distance; custom grids
+remain available through the lower-level tuning functions.
+
+UMAP and HDBSCAN still need memory for neighbor graphs and fitting. Sparse
+storage removes the avoidable dense document-vocabulary allocation; it does
+not make total memory use independent of dataset size.
 
 ## Evaluation Metrics
 
@@ -230,7 +298,7 @@ If you use TACTIK in your research, please cite:
 
 ## License
 
-MIT License — See `LICENSE` for details
+MIT License — See `license.txt` for details
 
 ## Contact
 

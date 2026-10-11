@@ -1,17 +1,26 @@
 # embeddings.py
+import inspect
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
-from umap import UMAP
 from sklearn.manifold import TSNE
-from sentence_transformers import SentenceTransformer
-from gensim import downloader as api 
-from gensim.models import Word2Vec
 import numpy as np
+from types import SimpleNamespace
+SentenceTransformer = None
+Word2Vec = None
+api = SimpleNamespace(load=None)
+torch = None
+UMAP = None
+
+
+def _ensure_gensim_scipy_compat():
+    """Restore the NumPy-backed alias removed by SciPy 1.13 for Gensim."""
+    import scipy.linalg
+    if not hasattr(scipy.linalg, "triu"):
+        scipy.linalg.triu = np.triu
 try:
     from .utilities import get_number_unique_words
 except ImportError:
     from utilities import get_number_unique_words
-import torch
 
 
 def vectorize_text(text, max_features=None):
@@ -218,6 +227,10 @@ def get_umap_embeddings(X, n_components=5, n_neighbors=10, min_dist=0.0,
     
     # Fit UMAP model
     try:
+        global UMAP
+        if UMAP is None:
+            from umap import UMAP as _UMAP
+            UMAP = _UMAP
         umap_model = UMAP(
             n_neighbors=n_neighbors,
             n_components=n_components,
@@ -246,14 +259,16 @@ def get_tsne_embeddings(X, n_components=2, perplexity=None, early_exaggeration=1
     structure and revealing clusters in the data.
     
     Important: t-SNE is computationally expensive and does not support transforming
-    new data points. For large datasets (>10,000 samples), consider using UMAP instead.
+    new data points. Sparse input is reduced with TruncatedSVD before a small
+    dense matrix is passed to t-SNE. t-SNE still has substantial compute and
+    memory costs as the number of documents grows.
     
     Parameters:
     -----------
     X : array-like or sparse matrix of shape (n_samples, n_features)
         Input features to embed. Typically a TF-IDF matrix, count matrix, or
-        other numerical representation of text. Sparse matrices will be converted
-        to dense arrays (may require significant memory for large matrices).
+        other numerical representation of text. Sparse matrices are reduced to
+        at most 50 components first to avoid a dense document-by-feature copy.
         
     n_components : int, optional (default=2)
         Dimension of the output embedding space. Typical values:
@@ -385,25 +400,38 @@ def get_tsne_embeddings(X, n_components=2, perplexity=None, early_exaggeration=1
             f"Consider using at least 1000 for good convergence."
         )
     
-    # Convert sparse to dense if needed (with memory warning for large matrices)
-    if hasattr(X, 'toarray'):
-        memory_gb = (n_samples * n_features * 8) / (1024**3)  # 8 bytes per float64
-        if memory_gb > 1 and verbose >= 0:
-            print(f"Warning: Converting sparse matrix to dense (~{memory_gb:.2f} GB memory required)")
-        X = X.toarray()
+    # sklearn's Barnes-Hut t-SNE cannot consume a sparse feature matrix. Reduce
+    # sparse TF-IDF first, so only a small document-by-component matrix becomes
+    # dense instead of the full document-by-vocabulary matrix.
+    if hasattr(X, 'tocsr'):
+        X = X.tocsr()
+        svd_components = min(50, n_features - 1, n_samples - 1)
+        if svd_components >= 1:
+            X = TruncatedSVD(
+                n_components=svd_components, random_state=random_state
+            ).fit_transform(X)
+        else:
+            X = X.toarray()
     
     # Fit t-SNE model
     try:
-        tsne = TSNE(
-            n_components=n_components,
-            perplexity=perplexity,
-            early_exaggeration=early_exaggeration,
-            learning_rate=learning_rate,
-            n_iter=n_iter,
-            metric=metric,
-            random_state=random_state,
-            verbose=verbose
+        # scikit-learn renamed ``n_iter`` to ``max_iter`` in newer releases.
+        # Keep supporting the project's older minimum version while working
+        # with current versions such as scikit-learn 1.7.
+        iteration_parameter = (
+            'max_iter' if 'max_iter' in inspect.signature(TSNE).parameters else 'n_iter'
         )
+        tsne_params = {
+            'n_components': n_components,
+            'perplexity': perplexity,
+            'early_exaggeration': early_exaggeration,
+            'learning_rate': learning_rate,
+            'metric': metric,
+            'random_state': random_state,
+            'verbose': verbose,
+        }
+        tsne_params[iteration_parameter] = n_iter
+        tsne = TSNE(**tsne_params)
         
         embeddings = tsne.fit_transform(X)
         
@@ -593,9 +621,15 @@ def get_sbert_embeddings(text, model=None, model_name='all-MiniLM-L6-v2',
     model_was_loaded = False
     if model is None:
         try:
+            global SentenceTransformer, torch
+            if SentenceTransformer is None:
+                from sentence_transformers import SentenceTransformer as _SentenceTransformer
+                SentenceTransformer = _SentenceTransformer
             if device is None:
                 # Auto-detect GPU
-                import torch
+                if torch is None:
+                    import torch as _torch
+                    torch = _torch
                 device = 'cuda' if torch.cuda.is_available() else 'cpu'
             
             model = SentenceTransformer(model_name, device=device)
@@ -604,6 +638,9 @@ def get_sbert_embeddings(text, model=None, model_name='all-MiniLM-L6-v2',
         except ImportError:
             # torch not available, use CPU
             try:
+                if SentenceTransformer is None:
+                    from sentence_transformers import SentenceTransformer as _SentenceTransformer
+                    SentenceTransformer = _SentenceTransformer
                 model = SentenceTransformer(model_name, device='cpu')
                 model_was_loaded = True
             except Exception as e:
@@ -944,6 +981,11 @@ def get_word2vec_embeddings(text, vector_size=100, window=5, min_count=1,
     
     # Train Word2Vec model
     try:
+        global Word2Vec
+        if Word2Vec is None:
+            _ensure_gensim_scipy_compat()
+            from gensim.models import Word2Vec as _Word2Vec
+            Word2Vec = _Word2Vec
         model = Word2Vec(
             sentences=text_list,
             vector_size=vector_size,
@@ -1189,6 +1231,11 @@ def get_pretrained_word_embeddings(text, model=None, model_name='glove-wiki-giga
     model_was_loaded = False
     if model is None:
         try:
+            global api
+            if api.load is None:
+                _ensure_gensim_scipy_compat()
+                from gensim import downloader as _api
+                api = _api
             print(f"Loading pretrained model '{model_name}'...")
             print("(This may take a while on first run - downloading and caching model)")
             model = api.load(model_name)

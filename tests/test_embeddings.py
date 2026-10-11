@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, issparse
 import warnings
 from unittest.mock import Mock, patch, MagicMock
 import sys
@@ -95,7 +95,7 @@ class TestGetUMAPEmbeddings(unittest.TestCase):
         np.random.seed(42)
         self.X = np.random.rand(50, 20)
         self.X_sparse = csr_matrix(self.X)
-    
+
     def test_basic_functionality(self):
         """Test basic UMAP embedding generation"""
         embeddings, model = get_umap_embeddings(self.X, n_components=5)
@@ -171,6 +171,40 @@ class TestGetTSNEEmbeddings(unittest.TestCase):
         np.random.seed(42)
         self.X = np.random.rand(50, 20)
         self.X_sparse = csr_matrix(self.X)
+
+    def test_iteration_argument_matches_scikit_learn_signature(self):
+        """Support both pre- and post-rename scikit-learn TSNE APIs."""
+        for parameter in ('n_iter', 'max_iter'):
+            with self.subTest(parameter=parameter):
+                signature = Mock(parameters={parameter: object()})
+                with patch('embeddings.inspect.signature', return_value=signature), \
+                        patch('embeddings.TSNE') as tsne_factory:
+                    tsne_factory.return_value.fit_transform.return_value = np.zeros((50, 2))
+                    get_tsne_embeddings(self.X, n_iter=300, perplexity=5)
+
+                kwargs = tsne_factory.call_args.kwargs
+                self.assertEqual(kwargs[parameter], 300)
+                other_parameter = 'max_iter' if parameter == 'n_iter' else 'n_iter'
+                self.assertNotIn(other_parameter, kwargs)
+
+    def test_sparse_input_is_reduced_before_tsne_without_densifying_features(self):
+        reducer = Mock()
+        reducer.fit_transform.return_value = np.zeros((50, 5))
+        tsne = Mock()
+        tsne.fit_transform.return_value = np.zeros((50, 2))
+        with patch('scipy.sparse.csr_matrix.toarray',
+                   side_effect=AssertionError('sparse input was densified')), \
+                patch('embeddings.TruncatedSVD', return_value=reducer) as svd_factory, \
+                patch('embeddings.TSNE', return_value=tsne) as tsne_factory:
+            coordinates, _ = get_tsne_embeddings(
+                self.X_sparse, perplexity=5, n_iter=250, random_state=9)
+
+        self.assertEqual(coordinates.shape, (50, 2))
+        self.assertTrue(issparse(svd_factory.return_value.fit_transform.call_args.args[0]))
+        tsne_input = tsne_factory.return_value.fit_transform.call_args.args[0]
+        self.assertFalse(issparse(tsne_input))
+        self.assertEqual(tsne_input.shape, (50, 5))
+        svd_factory.assert_called_once_with(n_components=19, random_state=9)
     
     @unittest.skipIf(sys.platform == 'win32', "t-SNE has threadpool issues on Windows")
     def test_basic_functionality(self):
@@ -182,8 +216,8 @@ class TestGetTSNEEmbeddings(unittest.TestCase):
         self.assertTrue(hasattr(model, 'kl_divergence_'))
     
     @unittest.skipIf(sys.platform == 'win32', "t-SNE has threadpool issues on Windows")
-    def test_sparse_to_dense_conversion(self):
-        """Test sparse matrix is converted to dense"""
+    def test_sparse_input_works_after_reduction(self):
+        """Test sparse matrix can be reduced and embedded."""
         embeddings, model = get_tsne_embeddings(self.X_sparse, n_components=2, random_state=42)
         self.assertEqual(embeddings.shape, (50, 2))
     
@@ -597,46 +631,48 @@ class TestGenerateAllEmbeddings(unittest.TestCase):
             ['this', 'document', 'is', 'second'],
             ['and', 'this', 'is', 'third']
         ] * 10
+
+        # Isolate orchestration tests from expensive dimensionality-reduction fits.
+        for name, default_components in (
+                ('get_umap_embeddings', 2),
+                ('get_tsne_embeddings', 2),
+                ('get_lsa_embeddings', 5),
+                ('get_word2vec_embeddings', 100)):
+            def fake_embedding(matrix, n_components=default_components, **kwargs):
+                return np.zeros((matrix.shape[0], n_components)), Mock()
+
+            embedding_patch = patch(f'embeddings.{name}', side_effect=fake_embedding)
+            embedding_patch.start()
+            self.addCleanup(embedding_patch.stop)
     
-@patch('embeddings.SentenceTransformer')
-@patch('embeddings.torch')
-@patch('gensim.downloader.load')
-def test_basic_functionality(self, mock_api_load, mock_torch, mock_st):
-    """Test basic functionality with all embeddings"""
-    # Mock SBERT
-    mock_torch.cuda.is_available.return_value = False
-    mock_sbert = Mock()
-    mock_sbert.encode.return_value = np.random.rand(30, 384)
-    mock_st.return_value = mock_sbert
-    
-    # Mock GloVe
-    mock_glove = Mock()
-    mock_glove.vector_size = 300
-    mock_glove.__len__ = Mock(return_value=10000)
-    mock_glove.__getitem__ = Mock(return_value=np.random.rand(300))
-    mock_glove.__contains__ = Mock(return_value=True)
-    mock_api_load.return_value = mock_glove
-    
-    # FIX: Provide a valid n_components for LSA, as the default (100) 
-    # will exceed the number of features (9) in the mocked TF-IDF matrix (30x9).
-    lsa_params = {'n_components': 5}
-    
-    embeddings, models = generate_all_embeddings(
-        self.valid_texts,
-        self.valid_tokens,
-        embedding_params={'lsa': lsa_params}, # <--- Passing LSA parameters here
-        verbose=False
-    )
-    
-    # Check embedding types (t-SNE may fail on Windows)
-    required_keys = ['tfidf', 'umap', 'lsa', 'sbert', 'word2vec', 'glove']
-    for key in required_keys:
-        self.assertIn(key, embeddings, f"Missing {key} in embeddings")
-        self.assertIsNotNone(embeddings[key])
-    
-    # Check models are returned
-    self.assertIn('vectorizer', models)
-    self.assertIn('sbert', models)
+    def test_basic_functionality(self):
+        """Test basic functionality with all embedding outputs."""
+        with patch('embeddings.get_umap_embeddings', return_value=(np.zeros((30, 2)), Mock())) as umap, \
+                patch('embeddings.get_tsne_embeddings', return_value=(np.zeros((30, 2)), Mock())) as tsne, \
+                patch('embeddings.get_lsa_embeddings', return_value=(np.zeros((30, 5)), Mock())) as lsa, \
+                patch('embeddings.get_sbert_embeddings', return_value=(np.zeros((30, 384)), Mock())) as sbert, \
+                patch('embeddings.get_word2vec_embeddings', return_value=(np.zeros((30, 50)), Mock())) as word2vec, \
+                patch('embeddings.get_pretrained_word_embeddings', return_value=(np.zeros((30, 300)), Mock())) as glove:
+            embeddings, models = generate_all_embeddings(
+                self.valid_texts,
+                self.valid_tokens,
+                embedding_params={'lsa': {'n_components': 5}},
+                verbose=False
+            )
+
+        required_keys = ['tfidf', 'umap', 'lsa', 'sbert', 'word2vec', 'glove']
+        for key in required_keys:
+            self.assertIn(key, embeddings, f"Missing {key} in embeddings")
+            self.assertIsNotNone(embeddings[key])
+        self.assertIn('vectorizer', models)
+        self.assertIn('sbert', models)
+        umap.assert_called_once()
+        tsne.assert_called_once()
+        lsa.assert_called_once()
+        self.assertEqual(lsa.call_args.kwargs['n_components'], 5)
+        sbert.assert_called_once()
+        word2vec.assert_called_once()
+        glove.assert_called_once()
 
     def test_none_input(self):
         """Test None input raises ValueError"""
@@ -695,10 +731,15 @@ def test_basic_functionality(self, mock_api_load, mock_torch, mock_st):
             )
         self.assertIn("must match", str(cm.exception))
     
+    @patch('embeddings.SentenceTransformer')
+    @patch('embeddings.torch')
     @patch('embeddings.get_pretrained_word_embeddings')
-    def test_custom_parameters(self, mock_get_pretrained):
+    def test_custom_parameters(self, mock_get_pretrained, mock_torch, mock_st):
         """Test with custom embedding parameters"""
-        # Mock the pretrained function to avoid import issues
+        mock_torch.cuda.is_available.return_value = False
+        mock_sbert = Mock()
+        mock_sbert.encode.return_value = np.random.rand(30, 384)
+        mock_st.return_value = mock_sbert
         mock_get_pretrained.return_value = (np.random.rand(30, 100), Mock())
         
         params = {
